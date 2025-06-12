@@ -11,3 +11,8 @@ class Mutation(AccountsMutation, graphene.ObjectType):
     refresh_token = graphql_jwt.Refresh.Field()
 
 schema = graphene.Schema(query=Query, mutation=Mutation)
+
+from stations.schema import StationMutation
+
+class Mutation(AccountsMutation, StationMutation, graphene.ObjectType):
+    pass
