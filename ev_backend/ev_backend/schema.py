@@ -1,8 +1,8 @@
 import graphene
 import graphql_jwt
 from accounts.schema import AccountsQuery, AccountsMutation
-
-class Query(AccountsQuery, graphene.ObjectType):
+from stations.schema import StationMutation, StationQuery
+class Query(AccountsQuery, StationQuery, graphene.ObjectType):
     pass
 
 class Mutation(AccountsMutation, graphene.ObjectType):
@@ -11,8 +11,6 @@ class Mutation(AccountsMutation, graphene.ObjectType):
     refresh_token = graphql_jwt.Refresh.Field()
 
 schema = graphene.Schema(query=Query, mutation=Mutation)
-
-from stations.schema import StationMutation
 
 class Mutation(AccountsMutation, StationMutation, graphene.ObjectType):
     pass
