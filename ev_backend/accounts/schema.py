@@ -2,6 +2,9 @@ import graphene
 from graphene_django import DjangoObjectType
 from django.contrib.auth import get_user_model
 from graphql_jwt.decorators import login_required
+
+from ev_backend.stations.models import Station
+from ev_backend.stations.schema import StationType
 from .permission import admin_required
 
 User = get_user_model()
@@ -11,6 +14,10 @@ class UserType(DjangoObjectType):
         model = User
         exclude = ("password",)
 
+    favorites = graphene.List(lambda: StationType)
+
+    def resolve_favorites(self, info):
+        return Station.objects.filter(favorited_by__user=self)
 
 class CreateUser(graphene.Mutation):
     user = graphene.Field(UserType)
