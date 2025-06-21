@@ -1,7 +1,7 @@
 import graphene
 from graphene_file_upload.scalars import Upload
 from graphene_django import DjangoObjectType
-from .models import Review, Station
+from .models import Favorite, Review, Station
 from graphql_jwt.decorators import login_required
 from accounts.permission import station_owner_required
 from django.db.models import Avg

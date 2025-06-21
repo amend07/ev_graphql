@@ -24,6 +24,7 @@ INSTALLED_APPS = [
     'django.contrib.staticfiles',
     'graphene_django',
     'graphene_file_upload',
+    'bookings',
     'accounts',
     'stations',
 ]
