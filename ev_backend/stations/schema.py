@@ -45,7 +45,7 @@ class CreateStationInput(graphene.InputObjectType):
 
 
 class StationListType(graphene.ObjectType):
-    id = graphene.ID()
+    station_id = graphene.ID()
     name = graphene.String()
     latitude = graphene.Float()
     longitude = graphene.Float()
@@ -120,13 +120,13 @@ class DeleteStation(graphene.Mutation):
     ok = graphene.Boolean()
 
     class Arguments:
-        id = graphene.ID(required=True)
+        stationId = graphene.ID(required=True)
 
     @login_required
     @station_owner_required
-    def mutate(self, info, id):
+    def mutate(self, info, stationId):
         user = info.context.user
-        station = Station.objects.get(id=id, owner=user)
+        station = Station.objects.get(id=stationId, owner=user)
         station.delete()
         return DeleteStation(ok=True)
 
@@ -191,7 +191,7 @@ class StationMutation(graphene.ObjectType):
     
         
 class StationQuery(graphene.ObjectType):
-    all_stations = graphene.List(StationType)
+    #all_stations = graphene.List(StationType)
     station_list = graphene.List(StationListType)
     filter_stations = graphene.List(
         StationListType,
@@ -201,7 +201,11 @@ class StationQuery(graphene.ObjectType):
         min_power=graphene.Float(),
         max_power=graphene.Float()
     )
-
+    station_by_id = graphene.Field(
+        StationType,
+        station_id=graphene.ID(required=True)
+    )
+    
     def resolve_filter_stations(self, info, charger_type=None, num_of_charger=None,
                                  min_rating=None, min_power=None, max_power=None):
         stations = Station.objects.filter(is_active=True)
@@ -232,8 +236,8 @@ class StationQuery(graphene.ObjectType):
             for station in stations
         ]
         
-    def resolve_all_stations(root, info):
-        return Station.objects.filter(is_active=True)
+    #def resolve_all_stations(root, info):
+        #return Station.objects.filter(is_active=True)
     
     def resolve_station_list(root, info):
         stations = Station.objects.filter(is_active=True)
@@ -251,3 +255,8 @@ class StationQuery(graphene.ObjectType):
             )
             for station in stations
         ]
+    def resolve_station_by_id(self, info, station_id):
+        try:
+            return Station.objects.get(id=station_id)
+        except Station.DoesNotExist:
+            raise Exception("Station not found")

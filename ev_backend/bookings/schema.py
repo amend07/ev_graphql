@@ -102,7 +102,7 @@ class BookingQuery(graphene.ObjectType):
     my_bookings = graphene.List(BookingType, status=graphene.String())
     station_bookings = graphene.List(
         BookingType,
-        station_id=graphene.ID(required=True),
+        booking_id=graphene.ID(required=True),
         status=graphene.String()
     )
     
@@ -116,11 +116,11 @@ class BookingQuery(graphene.ObjectType):
 
     @login_required
     @station_owner_required
-    def resolve_station_bookings(self, info, station_id, status=None):
+    def resolve_station_bookings(self, info, booking_id, status=None):
         user = info.context.user
 
         try:
-            station = Station.objects.get(id=station_id)
+            station = Station.objects.get(id=booking_id)
         except Station.DoesNotExist:
             raise Exception("Station not found")
 

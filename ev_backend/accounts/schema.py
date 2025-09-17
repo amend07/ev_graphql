@@ -2,7 +2,6 @@ import graphene
 from graphene_django import DjangoObjectType
 from django.contrib.auth import get_user_model
 from graphql_jwt.decorators import login_required
-
 from stations.models import Station
 from stations.schema import StationType
 from .permission import admin_required
@@ -10,6 +9,8 @@ from .permission import admin_required
 User = get_user_model()
 
 class UserType(DjangoObjectType):
+    
+    is_station_owner = graphene.Boolean()
     class Meta:
         model = User
         exclude = ("password",)
@@ -18,7 +19,9 @@ class UserType(DjangoObjectType):
 
     def resolve_favorites(self, info):
         return Station.objects.filter(favorited_by__user=self)
-
+    
+    def resolve_is_station_owner(self, info):
+        return self.role == "station_owner"
 class CreateUser(graphene.Mutation):
     user = graphene.Field(UserType)
 
@@ -26,63 +29,42 @@ class CreateUser(graphene.Mutation):
         username = graphene.String(required=True)
         email = graphene.String(required=True)
         password = graphene.String(required=True)
-
-    def mutate(self, info, username, email, password):
+        is_station_owner = graphene.Boolean(required=False, default_value=False)
+    
+    success = graphene.Boolean()
+    user_id = graphene.ID()  
+      
+    def mutate(self, info, username, email, password, is_station_owner=False):
         # Prevent duplicate email/username
         if User.objects.filter(username=username).exists():
             raise Exception("Username already exists")
         if User.objects.filter(email=email).exists():
             raise Exception("Email already registered")
 
+        role = "station_owner" if is_station_owner else "user"
+        
         user = User.objects.create_user(
             username=username,
             email=email,
             password=password,
-            role="user"  # ✅ Secure: role is hardcoded
-        )
-        return CreateUser(user=user)
-
-
-class RegisterStationOwner(graphene.Mutation):
-    user = graphene.Field(UserType)
-
-    class Arguments:
-        username = graphene.String(required=True)
-        email = graphene.String(required=True)
-        password = graphene.String(required=True)
-
-    def mutate(self, info, username, email, password):
-        User = get_user_model()
-
-        if User.objects.filter(username=username).exists():
-            raise Exception("Username already exists")
-        if User.objects.filter(email=email).exists():
-            raise Exception("Email already registered")
-
-        user = User.objects.create_user(
-            username=username,
-            email=email,
-            password=password,
-            role='station_owner',  # ✅ Fixed role
-            is_active=False         # ✅ Must be approved by admin
+            role=role,
         )
 
-        return RegisterStationOwner(user=user)
-
+        return CreateUser(success=True, user_id=user.id, user=user)
 
 class AdminQuery(graphene.ObjectType):
     users_by_role = graphene.List(UserType, role=graphene.String(required=True))
-    unapproved_station_owners = graphene.List(UserType)
+    #unapproved_station_owners = graphene.List(UserType)
 
     @login_required
     @admin_required
     def resolve_users_by_role(self, info, role):
         return User.objects.filter(role=role)
 
-    @login_required
-    @admin_required
-    def resolve_unapproved_station_owners(self, info):
-        return User.objects.filter(role='station_owner', is_active=False)
+    #@login_required
+    #@admin_required
+    #def resolve_unapproved_station_owners(self, info):
+    #    return User.objects.filter(role='station_owner', is_active=False)
     
 class DeleteUser(graphene.Mutation):
     ok = graphene.Boolean()
@@ -158,7 +140,6 @@ class ApproveStationOwner(graphene.Mutation):
 
 class AccountsMutation(graphene.ObjectType):
     create_user = CreateUser.Field()
-    register_station_owner = RegisterStationOwner.Field()
     approve_station_owner = ApproveStationOwner.Field()
     
    
