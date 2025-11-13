@@ -5,6 +5,9 @@ from .models import Favorite, Review, Station
 from graphql_jwt.decorators import login_required
 from accounts.permission import station_owner_required
 from django.db.models import Avg
+from django.db.models import Avg, Count, Exists, OuterRef, Value
+from django.db.models.functions import Coalesce
+
 
 class StationType(DjangoObjectType):
     num_of_reviews = graphene.Int()
@@ -54,6 +57,7 @@ class StationListType(graphene.ObjectType):
     num_of_rate = graphene.Int()
     average_rate = graphene.Float()
     is_favorite = graphene.Boolean()
+
 
 class CreateStation(graphene.Mutation):
     station = graphene.Field(StationType)
@@ -188,10 +192,9 @@ class StationMutation(graphene.ObjectType):
     delete_station = DeleteStation.Field()
     create_review = CreateReview.Field()
     toggle_favorite_station = ToggleFavoriteStation.Field()
-    
-        
+
+
 class StationQuery(graphene.ObjectType):
-    #all_stations = graphene.List(StationType)
     station_list = graphene.List(StationListType)
     filter_stations = graphene.List(
         StationListType,
@@ -201,60 +204,85 @@ class StationQuery(graphene.ObjectType):
         min_power=graphene.Float(),
         max_power=graphene.Float()
     )
-    station_by_id = graphene.Field(
-        StationType,
-        station_id=graphene.ID(required=True)
-    )
-    
+    station_by_id = graphene.Field(StationType, station_id=graphene.ID(required=True))
+
+    def resolve_station_list(self, info):
+        user = info.context.user
+
+        stations = Station.objects.filter(is_active=True).annotate(
+            num_of_rate=Count('reviews'),
+            average_rate=Coalesce(Avg('reviews__rating'), 0.0)
+        )
+
+        if user.is_authenticated:
+            favorite_subquery = Favorite.objects.filter(
+                user=user,
+                station=OuterRef('pk')
+            )
+            stations = stations.annotate(
+                is_favorite=Exists(favorite_subquery)
+            )
+        else:
+            stations = stations.annotate(
+                is_favorite=Value(False)
+            )
+
+        return [
+            StationListType(
+                station_id=station.id,
+                name=station.name,
+                latitude=station.latitude,
+                longitude=station.longitude,
+                charger_type=station.charger_type,
+                num_of_charger=station.num_of_charger,
+                num_of_rate=station.num_of_rate,
+                average_rate=round(station.average_rate, 1),
+                is_favorite=getattr(station, 'is_favorite', False)
+            )
+            for station in stations
+        ]
+
     def resolve_filter_stations(self, info, charger_type=None, num_of_charger=None,
-                                 min_rating=None, min_power=None, max_power=None):
-        stations = Station.objects.filter(is_active=True)
+                                min_rating=None, min_power=None, max_power=None):
+        user = info.context.user
+
+        stations = Station.objects.filter(is_active=True).annotate(
+            num_of_rate=Count('reviews'),
+            average_rate=Coalesce(Avg('reviews__rating'), 0.0)
+        )
+
+        if user.is_authenticated:
+            favorite_subquery = Favorite.objects.filter(user=user, station=OuterRef('pk'))
+            stations = stations.annotate(is_favorite=Exists(favorite_subquery))
+        else:
+            stations = stations.annotate(is_favorite=Value(False))
 
         if charger_type:
             stations = stations.filter(charger_type__icontains=charger_type)
         if num_of_charger:
             stations = stations.filter(num_of_charger=num_of_charger)
-        if min_rating:
+        if min_rating is not None:
             stations = stations.filter(average_rate__gte=min_rating)
-        if min_power:
+        if min_power is not None:
             stations = stations.filter(power_output_kw__gte=min_power)
-        if max_power:
+        if max_power is not None:
             stations = stations.filter(power_output_kw__lte=max_power)
 
         return [
             StationListType(
-                id=station.id,
-                name=station.name,
-                latitude=station.latitude,
-                longitude=station.longitude,
-                charger_type=station.charger_type,
-                num_of_charger=station.num_of_charger,
-                num_of_rate=station.num_of_rate,
-                average_rate=station.average_rate,
-                is_favorite=station.is_favorite
+                station_id=s.id,
+                name=s.name,
+                latitude=s.latitude,
+                longitude=s.longitude,
+                charger_type=s.charger_type,
+                num_of_charger=s.num_of_charger,
+                num_of_rate=s.num_of_rate,
+                average_rate=round(s.average_rate, 1),
+                is_favorite=getattr(s, 'is_favorite', False)
             )
-            for station in stations
+            for s in stations
         ]
-        
-    #def resolve_all_stations(root, info):
-        #return Station.objects.filter(is_active=True)
-    
-    def resolve_station_list(root, info):
-        stations = Station.objects.filter(is_active=True)
-        return [
-            StationListType(
-                id=station.id,
-                name=station.name,
-                latitude=station.latitude,
-                longitude=station.longitude,
-                charger_type=station.charger_type,
-                num_of_charger=station.num_of_charger,
-                num_of_rate=station.num_of_rate,
-                average_rate=station.average_rate,
-                is_favorite=station.is_favorite
-            )
-            for station in stations
-        ]
+
     def resolve_station_by_id(self, info, station_id):
         try:
             return Station.objects.get(id=station_id)
