@@ -1,11 +1,13 @@
 Hi {{ user.get_full_name|default:user.username }},
 
-Your one-time password (OTP) to reset your password is:
+You requested to reset your password. Use the following OTP code to verify your identity:
 
-    {{ otp }}
+OTP: {{ otp }}
 
-It expires in 10 minutes.
+This OTP code is valid for 10 minutes.
 
-If you didn’t request this, ignore this email.
+If you didn't request this password reset, please ignore this email and ensure your account is secure.
 
-— EV Backend Team
+— EV Charging Station Team
+
+This is an automated message, please do not reply to this email.

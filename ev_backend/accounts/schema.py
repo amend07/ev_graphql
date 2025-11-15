@@ -1,4 +1,3 @@
-# accounts/schema.py
 import graphene
 from graphene_django import DjangoObjectType
 from django.contrib.auth import get_user_model
@@ -9,14 +8,11 @@ from django.core.exceptions import ValidationError
 from stations.models import Station
 from stations.schema import StationType
 from .permission import admin_required
-from .models import User, PasswordResetOTP  # Make sure PasswordResetOTP is imported
+from .models import User, PasswordResetOTP
 
 User = get_user_model()
 
 
-# ------------------------------------------------------------------ #
-# USER TYPE
-# ------------------------------------------------------------------ #
 class UserType(DjangoObjectType):
     is_station_owner = graphene.Boolean()
 
@@ -33,9 +29,17 @@ class UserType(DjangoObjectType):
         return self.role == "station_owner"
 
 
-# ------------------------------------------------------------------ #
-# MUTATIONS
-# ------------------------------------------------------------------ #
+class OTPType(DjangoObjectType):
+    is_valid = graphene.Boolean()
+    
+    class Meta:
+        model = PasswordResetOTP
+        fields = ('otp', 'created_at', 'expires_at')
+    
+    def resolve_is_valid(self, info):
+        return timezone.now() <= self.expires_at
+
+
 class CreateUser(graphene.Mutation):
     user = graphene.Field(UserType)
     success = graphene.Boolean()
@@ -84,10 +88,6 @@ class ApproveStationOwner(graphene.Mutation):
         user.save()
         return ApproveStationOwner(success=True, user=user)
 
-
-# ------------------------------------------------------------------ #
-# OTP PASSWORD RESET MUTATIONS
-# ------------------------------------------------------------------ #
 class SendPasswordResetOtp(graphene.Mutation):
     success = graphene.Boolean()
     message = graphene.String()
@@ -104,8 +104,17 @@ class SendPasswordResetOtp(graphene.Mutation):
                 message="If the email is registered, an OTP has been sent."
             )
 
-        PasswordResetOTP.generate_for_user(user)
-        return SendPasswordResetOtp(success=True, message="OTP sent to your email.")
+        try:
+            PasswordResetOTP.generate_for_user(user)
+            return SendPasswordResetOtp(
+                success=True, 
+                message="OTP sent to your email."
+            )
+        except Exception as e:
+            return SendPasswordResetOtp(
+                success=False,
+                message="Failed to send OTP. Please try again later."
+            )
 
 
 class ResetPasswordWithOtp(graphene.Mutation):
@@ -118,41 +127,66 @@ class ResetPasswordWithOtp(graphene.Mutation):
         new_password = graphene.String(required=True)
 
     def mutate(self, info, email, otp, new_password):
+        if len(otp) != 6 or not otp.isdigit():
+            return ResetPasswordWithOtp(
+                success=False, 
+                message="OTP must be a 6-digit number"
+            )
+
         try:
             user = User.objects.get(email__iexact=email, is_active=True)
         except User.DoesNotExist:
-            return ResetPasswordWithOtp(success=False, message="Invalid request.")
+            return ResetPasswordWithOtp(
+                success=False, 
+                message="Invalid request."
+            )
 
         try:
             reset_obj = PasswordResetOTP.objects.get(user=user)
         except PasswordResetOTP.DoesNotExist:
-            return ResetPasswordWithOtp(success=False, message="No OTP request found.")
+            return ResetPasswordWithOtp(
+                success=False, 
+                message="No OTP request found. Please request a new OTP."
+            )
 
         if not reset_obj.is_valid(otp):
-            return ResetPasswordWithOtp(success=False, message="Invalid or expired OTP.")
+            reset_obj.delete()
+            return ResetPasswordWithOtp(
+                success=False, 
+                message="Invalid or expired OTP. Please request a new one."
+            )
 
         try:
             validate_password(new_password, user)
         except ValidationError as e:
-            return ResetPasswordWithOtp(success=False, message="; ".join(e.messages))
+            return ResetPasswordWithOtp(
+                success=False, 
+                message="; ".join(e.messages)
+            )
 
         user.set_password(new_password)
         user.save()
         reset_obj.delete()
 
-        return ResetPasswordWithOtp(success=True, message="Password reset successfully.")
+        return ResetPasswordWithOtp(
+            success=True, 
+            message="Password reset successfully. You can now login with your new password."
+        )
 
 
-# ------------------------------------------------------------------ #
-# ADMIN
-# ------------------------------------------------------------------ #
 class AdminQuery(graphene.ObjectType):
     users_by_role = graphene.List(UserType, role=graphene.String(required=True))
+    all_otps = graphene.List(OTPType) 
 
     @login_required
     @admin_required
     def resolve_users_by_role(self, info, role):
         return User.objects.filter(role=role)
+
+    @login_required
+    @admin_required
+    def resolve_all_otps(self, info):
+        return PasswordResetOTP.objects.all()
 
 
 class DeleteUser(graphene.Mutation):
@@ -193,12 +227,9 @@ class ToggleUserActive(graphene.Mutation):
 
 class AdminMutation(graphene.ObjectType):
     delete_user = DeleteUser.Field()
-    toggle_user_active = ToggleUserActive.Field()
+    toggle_user_active = ToggleUser_active.Field()
 
 
-# ------------------------------------------------------------------ #
-# PUBLIC QUERIES
-# ------------------------------------------------------------------ #
 class AccountsQuery(graphene.ObjectType):
     me = graphene.Field(UserType)
 
@@ -206,10 +237,6 @@ class AccountsQuery(graphene.ObjectType):
     def resolve_me(self, info):
         return info.context.user
 
-
-# ------------------------------------------------------------------ #
-# MUTATION ROOT
-# ------------------------------------------------------------------ #
 class AccountsMutation(graphene.ObjectType):
     create_user = CreateUser.Field()
     approve_station_owner = ApproveStationOwner.Field()

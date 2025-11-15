@@ -57,7 +57,6 @@ class CreateBooking(graphene.Mutation):
                 f"to {taken.end_time.strftime('%H:%M')}"
             )
 
-        # 6. All good → create
         booking = Booking.objects.create(
             user=user,
             station=station,
