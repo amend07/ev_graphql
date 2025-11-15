@@ -1,5 +1,6 @@
 
 from pathlib import Path
+from decouple import config
 import os
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
@@ -10,7 +11,7 @@ SECRET_KEY = 'django-insecure-y8yd0nrw5l)wp^7gjmcv#%04pphh$5pio!1pzg06550g%w1h)e
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
-ALLOWED_HOSTS = ['127.0.0.1', 'localhost', '10.0.2.2', '10.228.158.62', '0.0.0.0', '*']
+ALLOWED_HOSTS = ['127.0.0.1', 'localhost', '10.0.2.2', '172.24.143.62', '0.0.0.0', '*']
 
 MEDIA_URL = '/media/'
 MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
@@ -27,7 +28,20 @@ INSTALLED_APPS = [
     'bookings',
     'accounts',
     'stations',
+    'corsheaders',
 ]
+
+
+CORS_ALLOW_HEADERS = [
+    'authorization',
+    'content-type',
+    'x-csrftoken',
+    'x-requested-with',
+]
+
+CORS_ALLOW_ALL_ORIGINS = True
+CORS_ALLOW_CREDENTIALS = True
+
 
 GRAPHENE = {
     "SCHEMA": "ev_backend.schema.schema",  # You’ll define this file
@@ -42,6 +56,7 @@ AUTHENTICATION_BACKENDS = [
 ]
 
 MIDDLEWARE = [
+    'corsheaders.middleware.CorsMiddleware',
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
@@ -49,6 +64,7 @@ MIDDLEWARE = [
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
+    'ev_backend.csrf_exempt.DisableCSRF',
 ]
 
 ROOT_URLCONF = 'ev_backend.urls'
@@ -121,3 +137,18 @@ STATIC_URL = 'static/'
 # https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+
+
+if DEBUG:
+    EMAIL_BACKEND = 'django.core.mail.backends.console.EmailBackend'
+else:
+    EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
+
+EMAIL_HOST = 'smtp.gmail.com'
+EMAIL_PORT = 587
+EMAIL_USE_TLS = True
+EMAIL_HOST_USER = config('EMAIL_HOST_USER')
+EMAIL_HOST_PASSWORD = config('EMAIL_HOST_PASSWORD')
+DEFAULT_FROM_EMAIL = f'EV Charging <{config("EMAIL_HOST_USER")}>'
+
+OTP_VALIDITY_MINUTES = 10

@@ -1,0 +1,14 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"></head>
+<body style="font-family:Arial,Helvetica,sans-serif;">
+  <h2>Password Reset OTP</h2>
+  <p>Hi <strong>{{ user.get_full_name|default:user.username }}</strong>,</p>
+  <p>Your one-time password is:</p>
+  <p style="font-size:1.5em; font-weight:bold; letter-spacing:2px;">{{ otp }}</p>
+  <p>It expires in <strong>10 minutes</strong>.</p>
+  <p>If you didn’t request this, you can safely ignore this email.</p>
+  <hr>
+  <small>— EV Backend Team</small>
+</body>
+</html>

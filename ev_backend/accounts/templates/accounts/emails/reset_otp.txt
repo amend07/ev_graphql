@@ -1,0 +1,11 @@
+Hi {{ user.get_full_name|default:user.username }},
+
+Your one-time password (OTP) to reset your password is:
+
+    {{ otp }}
+
+It expires in 10 minutes.
+
+If you didn’t request this, ignore this email.
+
+— EV Backend Team

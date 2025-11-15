@@ -57,6 +57,7 @@ class StationListType(graphene.ObjectType):
     num_of_rate = graphene.Int()
     average_rate = graphene.Float()
     is_favorite = graphene.Boolean()
+    image = graphene.String()
 
 
 class CreateStation(graphene.Mutation):
@@ -87,7 +88,7 @@ class CreateStation(graphene.Mutation):
             estimated_time_min=input.estimated_time_min,
             price_per_kwh=input.price_per_kwh,
             charger_brand=input.charger_brand,
-            image=image  # 👈 handle uploaded file
+            image=image 
         )
         return CreateStation(station=station)
 
@@ -237,7 +238,8 @@ class StationQuery(graphene.ObjectType):
                 num_of_charger=station.num_of_charger,
                 num_of_rate=station.num_of_rate,
                 average_rate=round(station.average_rate, 1),
-                is_favorite=getattr(station, 'is_favorite', False)
+                is_favorite=getattr(station, 'is_favorite', False),
+                image=station.image.url if station.image else ''
             )
             for station in stations
         ]
@@ -278,7 +280,8 @@ class StationQuery(graphene.ObjectType):
                 num_of_charger=s.num_of_charger,
                 num_of_rate=s.num_of_rate,
                 average_rate=round(s.average_rate, 1),
-                is_favorite=getattr(s, 'is_favorite', False)
+                is_favorite=getattr(s, 'is_favorite', False),
+                image=s.image.url if s.image else ''
             )
             for s in stations
         ]
