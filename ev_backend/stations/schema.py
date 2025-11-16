@@ -111,12 +111,10 @@ class UpdateStation(graphene.Mutation):
         except Station.DoesNotExist:
             raise Exception("Station not found or not owned by you.")
 
-        # Update fields from input if provided
         if input:
             for field, value in input.items():
                 setattr(station, field, value)
 
-        # Update image if provided
         if image:
             station.image = image
 
@@ -150,7 +148,6 @@ class CreateReview(graphene.Mutation):
         user = info.context.user
         station = Station.objects.get(id=station_id)
 
-        # Optional: one review per user
         if Review.objects.filter(user=user, station=station).exists():
             raise Exception("You have already reviewed this station.")
 
@@ -181,7 +178,6 @@ class ToggleFavoriteStation(graphene.Mutation):
         except Station.DoesNotExist:
             return ToggleFavoriteStation(success=False, message="Station not found")
 
-        # Toggle logic
         favorite, created = Favorite.objects.get_or_create(user=user, station=station)
         if not created:
             favorite.delete()
@@ -208,6 +204,7 @@ class StationQuery(graphene.ObjectType):
         max_power=graphene.Float()
     )
     station_by_id = graphene.Field(StationType, station_id=graphene.ID(required=True))
+    my_stations = graphene.List(StationListType)
 
     def resolve_station_list(self, info):
         user = info.context.user
@@ -286,6 +283,39 @@ class StationQuery(graphene.ObjectType):
                 image=s.image.url if s.image else ''
             )
             for s in stations
+        ]
+    
+    @login_required
+    def resolve_my_stations(self, info):
+        user = info.context.user
+        
+        stations = Station.objects.filter(owner=user, is_active=True).annotate(
+            num_of_rate=Count('reviews'),
+            average_rate=Coalesce(Avg('reviews__rating'), 0.0)
+        )
+
+        favorite_subquery = Favorite.objects.filter(
+            user=user,
+            station=OuterRef('pk')
+        )
+        stations = stations.annotate(is_favorite=Exists(favorite_subquery))
+
+        return [
+            StationListType(
+                station_id=station.id,
+                name=station.name,
+                latitude=station.latitude,
+                longitude=station.longitude,
+                charger_type=station.charger_type,
+                num_of_charger=station.num_of_charger,
+                num_of_rate=station.num_of_rate,
+                average_rate=round(station.average_rate, 1),
+                power_output_kw=station.power_output_kw,
+                price_per_kwh=str(station.price_per_kwh),
+                is_favorite=getattr(station, 'is_favorite', False),
+                image=station.image.url if station.image else ''
+            )
+            for station in stations
         ]
 
     def resolve_station_by_id(self, info, station_id):
