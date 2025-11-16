@@ -56,6 +56,8 @@ class StationListType(graphene.ObjectType):
     num_of_charger = graphene.Int()
     num_of_rate = graphene.Int()
     average_rate = graphene.Float()
+    power_output_kw = graphene.Float()
+    price_per_kwh = graphene.String()
     is_favorite = graphene.Boolean()
     image = graphene.String()
 
@@ -220,13 +222,9 @@ class StationQuery(graphene.ObjectType):
                 user=user,
                 station=OuterRef('pk')
             )
-            stations = stations.annotate(
-                is_favorite=Exists(favorite_subquery)
-            )
+            stations = stations.annotate(is_favorite=Exists(favorite_subquery))
         else:
-            stations = stations.annotate(
-                is_favorite=Value(False)
-            )
+            stations = stations.annotate(is_favorite=Value(False))
 
         return [
             StationListType(
@@ -238,6 +236,8 @@ class StationQuery(graphene.ObjectType):
                 num_of_charger=station.num_of_charger,
                 num_of_rate=station.num_of_rate,
                 average_rate=round(station.average_rate, 1),
+                power_output_kw=station.power_output_kw,
+                price_per_kwh=str(station.price_per_kwh),
                 is_favorite=getattr(station, 'is_favorite', False),
                 image=station.image.url if station.image else ''
             )
@@ -245,7 +245,7 @@ class StationQuery(graphene.ObjectType):
         ]
 
     def resolve_filter_stations(self, info, charger_type=None, num_of_charger=None,
-                                min_rating=None, min_power=None, max_power=None):
+                            min_rating=None, min_power=None, max_power=None):
         user = info.context.user
 
         stations = Station.objects.filter(is_active=True).annotate(
@@ -280,7 +280,9 @@ class StationQuery(graphene.ObjectType):
                 num_of_charger=s.num_of_charger,
                 num_of_rate=s.num_of_rate,
                 average_rate=round(s.average_rate, 1),
-                is_favorite=getattr(s, 'is_favorite', False),
+                power_output_kw=s.power_output_kw,
+                price_per_kwh=str(s.price_per_kwh),
+                is_favorite=False if not user.is_authenticated else getattr(s, 'is_favorite', False),
                 image=s.image.url if s.image else ''
             )
             for s in stations
