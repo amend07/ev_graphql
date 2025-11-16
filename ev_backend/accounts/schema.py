@@ -227,7 +227,7 @@ class ToggleUserActive(graphene.Mutation):
 
 class AdminMutation(graphene.ObjectType):
     delete_user = DeleteUser.Field()
-    toggle_user_active = ToggleUser_active.Field()
+    toggle_user_active = ToggleUserActive.Field()
 
 
 class AccountsQuery(graphene.ObjectType):
