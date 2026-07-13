@@ -1,0 +1,12 @@
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+extend-exclude = ["migrations", "venv", ".venv", "staticfiles"]
+
+[tool.ruff.lint]
+# Critical correctness rules only (syntax errors, undefined names, f-string
+# misuse). Keeps CI meaningful without failing on pre-existing style choices.
+select = ["E9", "F63", "F7", "F82"]
+
+[tool.coverage.run]
+omit = ["*/migrations/*", "*/tests*.py", "*/venv/*", "manage.py", "*/wsgi.py", "*/asgi.py"]

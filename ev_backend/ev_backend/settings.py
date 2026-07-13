@@ -1,21 +1,26 @@
 
 from pathlib import Path
-from decouple import config
+from decouple import config, Csv
 import os
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-# Loaded from the environment in production; the insecure literal is a
-# local-dev fallback only. Set DJANGO_SECRET_KEY (and rotate it) for any deploy.
+# SECURITY: secret key comes from the environment. The insecure literal is a
+# dev-only fallback; production startup validation (end of file) rejects it.
 SECRET_KEY = config('DJANGO_SECRET_KEY', default='django-insecure-y8yd0nrw5l)wp^7gjmcv#%04pphh$5pio!1pzg06550g%w1h)e')
 
-# SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+# Debug is OFF by default. Development enables it with DJANGO_DEBUG=True (.env).
+DEBUG = config('DJANGO_DEBUG', default=False, cast=bool)
 
-ALLOWED_HOSTS = ['127.0.0.1', 'localhost', '10.0.2.2', '172.24.143.62', '0.0.0.0', '*']
+# Permissive localhost set in dev; explicit, env-driven allow-list in production.
+ALLOWED_HOSTS = config(
+    'DJANGO_ALLOWED_HOSTS',
+    default='127.0.0.1,localhost,0.0.0.0,10.0.2.2' if DEBUG else '',
+    cast=Csv(),
+)
 
 MEDIA_URL = '/media/'
-MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
+MEDIA_ROOT = config('MEDIA_ROOT', default=os.path.join(BASE_DIR, 'media'))
 
 INSTALLED_APPS = [
     'django.contrib.admin',
@@ -40,8 +45,15 @@ CORS_ALLOW_HEADERS = [
     'x-requested-with',
 ]
 
-CORS_ALLOW_ALL_ORIGINS = True
-CORS_ALLOW_CREDENTIALS = True
+# CORS: allow any origin only in development; production uses an explicit list
+# supplied via CORS_ALLOWED_ORIGINS (comma-separated, supports multiple frontends).
+CORS_ALLOW_ALL_ORIGINS = DEBUG
+if not DEBUG:
+    CORS_ALLOWED_ORIGINS = config('CORS_ALLOWED_ORIGINS', default='', cast=Csv())
+CORS_ALLOW_CREDENTIALS = config('CORS_ALLOW_CREDENTIALS', default=False, cast=bool)
+
+# Trusted origins for CSRF-protected views (admin, browsable clients).
+CSRF_TRUSTED_ORIGINS = config('CSRF_TRUSTED_ORIGINS', default='', cast=Csv())
 
 
 GRAPHENE = {
@@ -59,6 +71,7 @@ AUTHENTICATION_BACKENDS = [
 MIDDLEWARE = [
     'corsheaders.middleware.CorsMiddleware',
     'django.middleware.security.SecurityMiddleware',
+    'ev_backend.security_headers.SecurityHeadersMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
@@ -67,6 +80,17 @@ MIDDLEWARE = [
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
     'ev_backend.csrf_exempt.DisableCSRF',
 ]
+
+# Serve static files via WhiteNoise in production when the package is installed
+# (see requirements.txt). Skipped gracefully in local dev environments without it.
+try:
+    import whitenoise  # noqa: F401
+    MIDDLEWARE.insert(
+        MIDDLEWARE.index('django.middleware.security.SecurityMiddleware') + 1,
+        'whitenoise.middleware.WhiteNoiseMiddleware',
+    )
+except ImportError:
+    pass
 
 ROOT_URLCONF = 'ev_backend.urls'
 
@@ -91,12 +115,25 @@ WSGI_APPLICATION = 'ev_backend.wsgi.application'
 # Database
 # https://docs.djangoproject.com/en/5.2/ref/settings/#databases
 
-DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
+# Production databases are configured via DATABASE_URL (e.g. Postgres); local
+# development falls back to SQLite. conn_max_age keeps connections pooled.
+DATABASE_URL = config('DATABASE_URL', default='')
+if DATABASE_URL:
+    import dj_database_url
+    DATABASES = {
+        'default': dj_database_url.parse(
+            DATABASE_URL,
+            conn_max_age=config('DB_CONN_MAX_AGE', default=600, cast=int),
+            ssl_require=config('DB_SSL_REQUIRE', default=False, cast=bool),
+        )
     }
-}
+else:
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.sqlite3',
+            'NAME': BASE_DIR / 'db.sqlite3',
+        }
+    }
 
 
 # Credential (PIN) validation
@@ -127,6 +164,19 @@ USE_TZ = True
 # https://docs.djangoproject.com/en/5.2/howto/static-files/
 
 STATIC_URL = 'static/'
+STATIC_ROOT = config('STATIC_ROOT', default=os.path.join(BASE_DIR, 'staticfiles'))
+
+# Compressed, cache-busted static files via WhiteNoise when installed.
+try:
+    import whitenoise  # noqa: F401
+    STORAGES = {
+        "default": {"BACKEND": "django.core.files.storage.FileSystemStorage"},
+        "staticfiles": {
+            "BACKEND": "whitenoise.storage.CompressedManifestStaticFilesStorage"
+        },
+    }
+except ImportError:
+    pass
 
 # Default primary key field type
 # https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field
@@ -134,17 +184,22 @@ STATIC_URL = 'static/'
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 
-if DEBUG:
-    EMAIL_BACKEND = 'django.core.mail.backends.console.EmailBackend'
-else:
-    EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
-
-EMAIL_HOST = 'smtp.gmail.com'
-EMAIL_PORT = 587
-EMAIL_USE_TLS = True
-EMAIL_HOST_USER = config('EMAIL_HOST_USER')
-EMAIL_HOST_PASSWORD = config('EMAIL_HOST_PASSWORD')
-DEFAULT_FROM_EMAIL = f'EV Charging <{config("EMAIL_HOST_USER")}>'
+# Email is fully env-driven with safe defaults so settings import even without a
+# .env (needed for CI/tests). Console backend in dev; SMTP in production.
+EMAIL_BACKEND = config(
+    'EMAIL_BACKEND',
+    default='django.core.mail.backends.console.EmailBackend' if DEBUG
+    else 'django.core.mail.backends.smtp.EmailBackend',
+)
+EMAIL_HOST = config('EMAIL_HOST', default='smtp.gmail.com')
+EMAIL_PORT = config('EMAIL_PORT', default=587, cast=int)
+EMAIL_USE_TLS = config('EMAIL_USE_TLS', default=True, cast=bool)
+EMAIL_HOST_USER = config('EMAIL_HOST_USER', default='')
+EMAIL_HOST_PASSWORD = config('EMAIL_HOST_PASSWORD', default='')
+DEFAULT_FROM_EMAIL = config(
+    'DEFAULT_FROM_EMAIL',
+    default=f'EV Charging <{EMAIL_HOST_USER or "no-reply@example.com"}>',
+)
 
 # ---------------------------------------------------------------------------
 # Sprint 3 — Authentication hardening
@@ -200,21 +255,43 @@ GRAPHQL_JWT = {
 
 # Structured authentication logging (Part 5). The accounts.auth_logging helper
 # scrubs sensitive fields, so PINs/OTPs/tokens are never written here.
+# All handlers write to stdout, which is log-rotation friendly (the container/
+# platform captures and rotates stdout). Security-relevant loggers are separated
+# from application logs. Sensitive values are scrubbed before logging by the
+# accounts.auth_logging helper — PINs/OTPs/JWTs/secrets are never written.
 LOGGING = {
     "version": 1,
     "disable_existing_loggers": False,
     "formatters": {
+        "verbose": {"format": "%(asctime)s %(levelname)s %(name)s [%(process)d] %(message)s"},
         "auth": {"format": "%(asctime)s %(levelname)s %(name)s %(message)s"},
     },
     "handlers": {
-        "auth_console": {"class": "logging.StreamHandler", "formatter": "auth"},
+        "console": {"class": "logging.StreamHandler", "formatter": "verbose"},
+        "security_console": {"class": "logging.StreamHandler", "formatter": "auth"},
     },
+    "root": {"handlers": ["console"], "level": config('LOG_LEVEL', default='INFO')},
     "loggers": {
+        "django": {
+            "handlers": ["console"],
+            "level": config('DJANGO_LOG_LEVEL', default='INFO'),
+            "propagate": False,
+        },
+        "django.request": {"handlers": ["console"], "level": "ERROR", "propagate": False},
+        "ev_backend": {
+            "handlers": ["console"],
+            "level": config('APP_LOG_LEVEL', default='INFO'),
+            "propagate": False,
+        },
+        # --- security-relevant loggers ---
         "accounts.auth": {
-            "handlers": ["auth_console"],
+            "handlers": ["security_console"],
             "level": config('AUTH_LOG_LEVEL', default='INFO'),
             "propagate": False,
         },
+        "ev_backend.graphql": {"handlers": ["console"], "level": "WARNING", "propagate": False},
+        "ev_backend.security": {"handlers": ["security_console"], "level": "INFO", "propagate": False},
+        "ev_backend.health": {"handlers": ["console"], "level": "WARNING", "propagate": False},
     },
 }
 
@@ -264,3 +341,58 @@ DATA_UPLOAD_MAX_NUMBER_FIELDS = config('DATA_UPLOAD_MAX_NUMBER_FIELDS', default=
 
 # Caching (Part 6) — public station list only; never user-specific data.
 STATION_LIST_CACHE_SECONDS = config('STATION_LIST_CACHE_SECONDS', default=30, cast=int)
+
+# ---------------------------------------------------------------------------
+# Sprint 6 — Production readiness & deployment hardening
+# ---------------------------------------------------------------------------
+
+# --- Security headers (Part 2) — safe in dev; HTTPS-only ones gated on prod ---
+SECURE_CONTENT_TYPE_NOSNIFF = True                       # X-Content-Type-Options
+SECURE_REFERRER_POLICY = config('SECURE_REFERRER_POLICY', default='strict-origin-when-cross-origin')
+X_FRAME_OPTIONS = config('X_FRAME_OPTIONS', default='DENY')
+PERMISSIONS_POLICY = config('PERMISSIONS_POLICY', default='geolocation=(), microphone=(), camera=()')
+
+if not DEBUG:
+    # Behind a TLS-terminating proxy/load balancer.
+    SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+    SECURE_SSL_REDIRECT = config('SECURE_SSL_REDIRECT', default=True, cast=bool)
+    SECURE_HSTS_SECONDS = config('SECURE_HSTS_SECONDS', default=31536000, cast=int)
+    SECURE_HSTS_INCLUDE_SUBDOMAINS = config('SECURE_HSTS_INCLUDE_SUBDOMAINS', default=True, cast=bool)
+    SECURE_HSTS_PRELOAD = config('SECURE_HSTS_PRELOAD', default=True, cast=bool)
+    SESSION_COOKIE_SECURE = True
+    CSRF_COOKIE_SECURE = True
+    SESSION_COOKIE_HTTPONLY = True
+    SESSION_COOKIE_SAMESITE = config('SESSION_COOKIE_SAMESITE', default='Lax')
+    CSRF_COOKIE_SAMESITE = config('CSRF_COOKIE_SAMESITE', default='Lax')
+
+# --- Fail-fast environment validation (Part 4) ---
+# In production, refuse to start if required secure configuration is missing.
+# Skipped while running the test suite so `manage.py test` works without a full
+# production environment.
+import sys as _sys
+
+_RUNNING_TESTS = 'test' in _sys.argv
+if (not DEBUG and not _RUNNING_TESTS
+        and config('DJANGO_SKIP_PROD_CHECK', default=False, cast=bool) is False):
+    from django.core.exceptions import ImproperlyConfigured
+
+    _problems = []
+    if SECRET_KEY.startswith('django-insecure'):
+        _problems.append('DJANGO_SECRET_KEY must be a strong, unique secret (not the dev default).')
+    if not ALLOWED_HOSTS:
+        _problems.append('DJANGO_ALLOWED_HOSTS must list the production host(s).')
+    if str(GRAPHQL_JWT.get('JWT_SECRET_KEY', '')).startswith('django-insecure'):
+        _problems.append('JWT_SECRET_KEY (or DJANGO_SECRET_KEY) must be a strong secret.')
+    if EMAIL_BACKEND.endswith('smtp.EmailBackend') and not (EMAIL_HOST_USER and EMAIL_HOST_PASSWORD):
+        _problems.append('EMAIL_HOST_USER/EMAIL_HOST_PASSWORD are required for SMTP email (OTP delivery).')
+    if not DATABASE_URL and DATABASES['default']['ENGINE'].endswith('sqlite3'):
+        _problems.append('DATABASE_URL must point at a production database (SQLite is not supported in production).')
+    if not CACHES.get('default'):
+        _problems.append('A cache backend must be configured (set REDIS_URL for a shared cache).')
+
+    if _problems:
+        raise ImproperlyConfigured(
+            'Refusing to start: production configuration is incomplete.\n- '
+            + '\n- '.join(_problems)
+            + '\n(Set DJANGO_DEBUG=True for local development, or fix the above for production.)'
+        )

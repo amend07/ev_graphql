@@ -105,10 +105,17 @@ class HealthEndpoints(TestCase):
         self.assertEqual(res.status_code, 200)
         self.assertEqual(res.json()["status"], "ok")
 
-    def test_readiness_db_ok(self):
+    def test_liveness(self):
+        res = DjangoClient().get("/live/")
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.json()["status"], "ok")
+
+    def test_readiness_db_and_cache_ok(self):
         res = DjangoClient().get("/ready/")
         self.assertEqual(res.status_code, 200)
-        self.assertEqual(res.json()["database"], "ok")
+        body = res.json()
+        self.assertEqual(body["database"], "ok")
+        self.assertEqual(body["cache"], "ok")
 
     def test_version(self):
         res = DjangoClient().get("/version/")
