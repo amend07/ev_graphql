@@ -5,7 +5,9 @@ import os
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-SECRET_KEY = 'django-insecure-y8yd0nrw5l)wp^7gjmcv#%04pphh$5pio!1pzg06550g%w1h)e'
+# Loaded from the environment in production; the insecure literal is a
+# local-dev fallback only. Set DJANGO_SECRET_KEY (and rotate it) for any deploy.
+SECRET_KEY = config('DJANGO_SECRET_KEY', default='django-insecure-y8yd0nrw5l)wp^7gjmcv#%04pphh$5pio!1pzg06550g%w1h)e')
 
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
@@ -144,4 +146,74 @@ EMAIL_HOST_USER = config('EMAIL_HOST_USER')
 EMAIL_HOST_PASSWORD = config('EMAIL_HOST_PASSWORD')
 DEFAULT_FROM_EMAIL = f'EV Charging <{config("EMAIL_HOST_USER")}>'
 
-OTP_VALIDITY_MINUTES = 10
+# ---------------------------------------------------------------------------
+# Sprint 3 — Authentication hardening
+# ---------------------------------------------------------------------------
+from datetime import timedelta
+
+# OTP policy (Part 2)
+OTP_LENGTH = config('OTP_LENGTH', default=6, cast=int)
+OTP_VALIDITY_MINUTES = config('OTP_VALIDITY_MINUTES', default=10, cast=int)
+OTP_MAX_ATTEMPTS = config('OTP_MAX_ATTEMPTS', default=5, cast=int)
+OTP_REQUEST_COOLDOWN_SECONDS = config('OTP_REQUEST_COOLDOWN_SECONDS', default=60, cast=int)
+
+# Brute-force protection (Part 3) — per-IP and per-account. window/lockout in seconds.
+AUTH_RATELIMIT = {
+    "LOGIN": {
+        "limit": config('RL_LOGIN_LIMIT', default=10, cast=int),
+        "window": config('RL_LOGIN_WINDOW', default=300, cast=int),
+        "lockout": config('RL_LOGIN_LOCKOUT', default=900, cast=int),
+    },
+    "OTP_REQUEST": {
+        "limit": config('RL_OTP_REQUEST_LIMIT', default=5, cast=int),
+        "window": config('RL_OTP_REQUEST_WINDOW', default=3600, cast=int),
+        "lockout": config('RL_OTP_REQUEST_LOCKOUT', default=3600, cast=int),
+    },
+    "OTP_VERIFY": {
+        "limit": config('RL_OTP_VERIFY_LIMIT', default=10, cast=int),
+        "window": config('RL_OTP_VERIFY_WINDOW', default=900, cast=int),
+        "lockout": config('RL_OTP_VERIFY_LOCKOUT', default=900, cast=int),
+    },
+}
+
+# Rate-limit / lockout state store. Local-memory by default (per-process);
+# set REDIS_URL in production for a shared, cross-worker cache.
+_REDIS_URL = config('REDIS_URL', default='')
+if _REDIS_URL:
+    CACHES = {"default": {"BACKEND": "django.core.cache.backends.redis.RedisCache", "LOCATION": _REDIS_URL}}
+else:
+    CACHES = {"default": {"BACKEND": "django.core.cache.backends.locmem.LocMemCache", "LOCATION": "auth-throttle"}}
+
+# JWT hardening (Part 4). Explicit HS256, verified expiry, short-lived access
+# tokens with refresh support. Header prefix stays "JWT" to match the Flutter
+# client's AuthLink ("JWT <token>"). Secret is env-driven, falling back to
+# SECRET_KEY so existing tokens keep verifying.
+GRAPHQL_JWT = {
+    "JWT_ALGORITHM": "HS256",
+    "JWT_SECRET_KEY": config('JWT_SECRET_KEY', default=SECRET_KEY),
+    "JWT_VERIFY_EXPIRATION": True,
+    "JWT_EXPIRATION_DELTA": timedelta(minutes=config('JWT_ACCESS_MINUTES', default=30, cast=int)),
+    "JWT_ALLOW_REFRESH": True,
+    "JWT_REFRESH_EXPIRATION_DELTA": timedelta(days=config('JWT_REFRESH_DAYS', default=7, cast=int)),
+    "JWT_AUTH_HEADER_PREFIX": "JWT",
+}
+
+# Structured authentication logging (Part 5). The accounts.auth_logging helper
+# scrubs sensitive fields, so PINs/OTPs/tokens are never written here.
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "auth": {"format": "%(asctime)s %(levelname)s %(name)s %(message)s"},
+    },
+    "handlers": {
+        "auth_console": {"class": "logging.StreamHandler", "formatter": "auth"},
+    },
+    "loggers": {
+        "accounts.auth": {
+            "handlers": ["auth_console"],
+            "level": config('AUTH_LOG_LEVEL', default='INFO'),
+            "propagate": False,
+        },
+    },
+}

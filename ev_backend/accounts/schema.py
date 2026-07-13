@@ -1,49 +1,19 @@
+import logging
+
 import graphene
 import graphql_jwt
 from graphene_django import DjangoObjectType
-from django.contrib.auth import get_user_model, update_session_auth_hash
-from django.utils import timezone
+from django.contrib.auth import get_user_model
 from graphql_jwt.decorators import login_required
-from django.contrib.auth.password_validation import validate_password
-from django.core.exceptions import ValidationError
 
 from stations.models import Station
 from stations.schema import StationType
 from .permission import admin_required
 from .models import User, PasswordResetOTP
+from . import services, ratelimit
+from .auth_logging import log_event
 
 User = get_user_model()
-
-
-def _invalidate_other_sessions(user, info=None):
-    """Best-effort invalidation of a user's existing auth after a PIN change.
-
-    Changing ``user.password`` already rotates the value Django's session-auth
-    hash is derived from, so other Django sessions stop authenticating. When an
-    authenticated request is available we call ``update_session_auth_hash`` so
-    the *current* caller stays signed in while siblings are dropped. If the
-    long-running JWT refresh-token app is installed, its tokens are revoked so
-    expired access tokens cannot be renewed.
-
-    Stateless JWT access tokens already issued remain valid until they expire;
-    revoking those mid-flight would require a token blacklist, i.e. an
-    authentication-architecture change that is intentionally out of scope here.
-    """
-    request = getattr(info, "context", None) if info is not None else None
-    if request is not None and getattr(request, "user", None) == user:
-        try:
-            update_session_auth_hash(request, user)
-        except Exception:
-            pass
-
-    try:  # revoke stored refresh tokens only if that app is installed
-        from graphql_jwt.refresh_token.models import RefreshToken
-
-        RefreshToken.objects.filter(user=user, revoked__isnull=True).update(
-            revoked=timezone.now()
-        )
-    except Exception:
-        pass
 
 
 class UserType(DjangoObjectType):
@@ -51,7 +21,7 @@ class UserType(DjangoObjectType):
 
     class Meta:
         model = User
-        exclude = ("password",)
+        exclude = ("password",)  # credential hash is never exposed
 
     favorites = graphene.List(lambda: StationType)
 
@@ -61,24 +31,30 @@ class UserType(DjangoObjectType):
     def resolve_is_station_owner(self, info):
         return self.role == "station_owner"
 
+
 class OTPType(DjangoObjectType):
     is_valid = graphene.Boolean()
 
     class Meta:
         model = PasswordResetOTP
-        fields = ("otp", "created_at", "expires_at")
+        # Only non-sensitive metadata — never the code or its hash.
+        fields = ("created_at", "expires_at", "attempts")
 
     def resolve_is_valid(self, info):
-        return timezone.now() <= self.expires_at
+        return not self.is_expired()
+
 
 class CustomObtainJSONWebToken(graphql_jwt.JSONWebTokenMutation):
-    """Custom tokenAuth that returns token, refreshToken, and user.
+    """tokenAuth returning token, refreshToken, and user.
 
-    The credential is exposed as ``pin`` (not ``password``). graphql_jwt's
-    ``JSONWebTokenMutation.Field`` hard-injects a required ``password`` argument
-    and its ``@token_auth`` decorator reads ``password`` from kwargs, so we
-    override ``Field`` to advertise ``pin`` and translate it back to
-    ``password`` before delegating to graphql_jwt.
+    The credential is accepted as ``pin`` (canonical) or ``password`` (legacy,
+    for the existing Flutter client). graphql_jwt's ``JSONWebTokenMutation.Field``
+    hard-injects a required ``password`` arg and its ``@token_auth`` decorator
+    reads ``password``; we override ``Field`` to advertise both as optional and
+    translate whichever is supplied into ``password`` for authentication.
+
+    Rate-limited per IP and per account; failures return a generic message and
+    are logged (without any credential) to prevent account enumeration.
     """
     user = graphene.Field(UserType)
     refresh_token = graphene.String()
@@ -87,7 +63,8 @@ class CustomObtainJSONWebToken(graphql_jwt.JSONWebTokenMutation):
     def Field(cls, *args, **kwargs):
         cls._meta.arguments.update({
             get_user_model().USERNAME_FIELD: graphene.String(required=True),
-            "pin": graphene.String(required=True),
+            "pin": graphene.String(required=False),
+            "password": graphene.String(required=False),  # legacy alias
         })
         # Skip JSONWebTokenMutation.Field (it would re-add a required `password`).
         return super(graphql_jwt.JSONWebTokenMutation, cls).Field(*args, **kwargs)
@@ -98,28 +75,43 @@ class CustomObtainJSONWebToken(graphql_jwt.JSONWebTokenMutation):
 
     @classmethod
     def mutate(cls, root, info, **input):
+        request = info.context
+        ip = ratelimit.get_client_ip(request)
         username = input.get("username")
-        pin = input.get("pin")
-
-        # Login intentionally does NOT enforce the 6-digit format: pre-existing
-        # accounts created under the old policy must still be able to sign in
-        # (backward compatibility). The new format is enforced wherever a
-        # credential is *set* — registration, PIN reset, and PIN change.
-        if not pin:
+        credential = input.get("pin") or input.get("password")
+        if not credential:
             raise Exception("PIN is required.")
 
-        if username and "@" in username:
-            try:
-                user_obj = User.objects.get(email__iexact=username)
-                username = user_obj.username
-            except User.DoesNotExist:
-                pass
+        # Brute-force protection: per IP and per account.
+        try:
+            ratelimit.enforce("LOGIN", ip, "ip")
+            if username:
+                ratelimit.enforce("LOGIN", username.lower(), "account")
+        except ratelimit.RateLimitExceeded:
+            log_event("account_locked", request=request, level=logging.WARNING,
+                      reason="login_attempts")
+            raise Exception(services.GENERIC_RATE_LIMITED)
 
-        # graphql_jwt authenticates on the `password` kwarg; hand it the PIN.
-        result = super().mutate(root, info, username=username, password=pin)
+        # Allow signing in with an email as well as a username.
+        if username and "@" in username:
+            found = User.objects.filter(email__iexact=username).first()
+            if found:
+                username = found.username
+
+        try:
+            result = super().mutate(root, info, username=username, password=credential)
+        except Exception:
+            log_event("login_failure", request=request)
+            raise Exception("Please enter valid credentials")  # generic
+
+        user = getattr(info.context, "user", None)
+        ratelimit.reset("LOGIN", ip, "ip")
+        if username:
+            ratelimit.reset("LOGIN", username.lower(), "account")
+        log_event("login_success", request=request, user=user)
 
         result.refresh_token = result.refresh_token
-        result.user = info.context.user
+        result.user = user
         return result
 
 
@@ -131,30 +123,20 @@ class CreateUser(graphene.Mutation):
     class Arguments:
         username = graphene.String(required=True)
         email = graphene.String(required=True)
-        pin = graphene.String(required=True)
+        pin = graphene.String(required=False)
+        password = graphene.String(required=False)  # legacy alias
         is_station_owner = graphene.Boolean(required=False, default_value=False)
 
-    def mutate(self, info, username, email, pin, is_station_owner=False):
-        # Enforce the 6-digit PIN policy before creating the account.
+    def mutate(self, info, username, email, pin=None, password=None, is_station_owner=False):
+        credential = pin or password
+        if not credential:
+            raise Exception("PIN is required.")
         try:
-            validate_password(pin)
-        except ValidationError as e:
-            raise Exception("; ".join(e.messages))
-
-        if User.objects.filter(username=username).exists():
-            raise Exception("Username already exists")
-        if User.objects.filter(email=email).exists():
-            raise Exception("Email already registered")
-
-        role = "station_owner" if is_station_owner else "user"
-        # create_user hashes the PIN via Django's configured password hasher;
-        # it is never persisted in plaintext.
-        user = User.objects.create_user(
-            username=username,
-            email=email,
-            password=pin,
-            role=role,
-        )
+            user = services.create_account(
+                username, email, credential, is_station_owner, request=info.context
+            )
+        except services.CredentialError as e:
+            raise Exception(str(e))
         return CreateUser(success=True, user_id=user.id, user=user)
 
 
@@ -180,6 +162,8 @@ class ApproveStationOwner(graphene.Mutation):
         return ApproveStationOwner(success=True, user=user)
 
 
+# ── Canonical PIN mutations ──────────────────────────────────────────────────
+
 class SendPinResetOtp(graphene.Mutation):
     success = graphene.Boolean()
     message = graphene.String()
@@ -189,18 +173,10 @@ class SendPinResetOtp(graphene.Mutation):
 
     def mutate(self, info, email):
         try:
-            user = User.objects.get(email__iexact=email, is_active=True)
-        except User.DoesNotExist:
-            return SendPinResetOtp(
-                success=True,
-                message="If the email is registered, an OTP has been sent."
-            )
-
-        try:
-            PasswordResetOTP.generate_for_user(user)
-            return SendPinResetOtp(success=True, message="OTP sent to your email.")
-        except Exception:
-            return SendPinResetOtp(success=False, message="Failed to send OTP.")
+            message = services.send_reset_otp(email, request=info.context)
+        except ratelimit.RateLimitExceeded:
+            return SendPinResetOtp(success=False, message=services.GENERIC_RATE_LIMITED)
+        return SendPinResetOtp(success=True, message=message)
 
 
 class ResetPinWithOtp(graphene.Mutation):
@@ -213,38 +189,11 @@ class ResetPinWithOtp(graphene.Mutation):
         new_pin = graphene.String(required=True)
 
     def mutate(self, info, email, otp, new_pin):
-        if len(otp) != 6 or not otp.isdigit():
-            return ResetPinWithOtp(success=False, message="OTP must be a 6-digit number")
-
         try:
-            user = User.objects.get(email__iexact=email, is_active=True)
-        except User.DoesNotExist:
-            return ResetPinWithOtp(success=False, message="Invalid request.")
-
-        try:
-            reset_obj = PasswordResetOTP.objects.get(user=user)
-        except PasswordResetOTP.DoesNotExist:
-            return ResetPinWithOtp(success=False, message="No OTP request found.")
-
-        if not reset_obj.is_valid(otp):
-            reset_obj.delete()
-            return ResetPinWithOtp(success=False, message="Invalid or expired OTP.")
-
-        try:
-            validate_password(new_pin, user)
-        except ValidationError as e:
-            return ResetPinWithOtp(success=False, message="; ".join(e.messages))
-
-        # set_password hashes the new PIN; it is never stored in plaintext.
-        user.set_password(new_pin)
-        user.save()
-        reset_obj.delete()
-        # A reset is account recovery — drop any renewable sessions/tokens.
-        _invalidate_other_sessions(user, info)
-        return ResetPinWithOtp(
-            success=True,
-            message="PIN reset successfully."
-        )
+            success, message = services.reset_pin(email, otp, new_pin, request=info.context)
+        except ratelimit.RateLimitExceeded:
+            return ResetPinWithOtp(success=False, message=services.GENERIC_RATE_LIMITED)
+        return ResetPinWithOtp(success=success, message=message)
 
 
 class ChangePin(graphene.Mutation):
@@ -258,32 +207,66 @@ class ChangePin(graphene.Mutation):
 
     @login_required
     def mutate(self, info, current_pin, new_pin):
-        user = info.context.user
-
-        if not user.check_password(current_pin):
-            return ChangePin(
-                success=False,
-                message="Current PIN is incorrect."
-            )
-
-        try:
-            validate_password(new_pin, user)
-        except ValidationError as e:
-            return ChangePin(
-                success=False,
-                message="; ".join(e.messages)
-            )
-
-        # set_password hashes the new PIN; it is never stored in plaintext.
-        user.set_password(new_pin)
-        user.save()
-        # Keep this caller signed in, invalidate the user's other sessions.
-        _invalidate_other_sessions(user, info)
-
-        return ChangePin(
-            success=True,
-            message="PIN changed successfully."
+        success, message = services.change_pin(
+            info.context.user, current_pin, new_pin, request=info.context
         )
+        return ChangePin(success=success, message=message)
+
+
+# ── Deprecated password-named aliases (existing Flutter client) ──────────────
+# Thin wrappers over the same service functions; kept so current GraphQL
+# clients that still send `password`/`changePassword`/etc. keep working.
+
+class SendPasswordResetOtp(graphene.Mutation):
+    """Deprecated alias of sendPinResetOtp."""
+    success = graphene.Boolean()
+    message = graphene.String()
+
+    class Arguments:
+        email = graphene.String(required=True)
+
+    def mutate(self, info, email):
+        try:
+            message = services.send_reset_otp(email, request=info.context)
+        except ratelimit.RateLimitExceeded:
+            return SendPasswordResetOtp(success=False, message=services.GENERIC_RATE_LIMITED)
+        return SendPasswordResetOtp(success=True, message=message)
+
+
+class ResetPasswordWithOtp(graphene.Mutation):
+    """Deprecated alias of resetPinWithOtp; accepts legacy `newPassword`."""
+    success = graphene.Boolean()
+    message = graphene.String()
+
+    class Arguments:
+        email = graphene.String(required=True)
+        otp = graphene.String(required=True)
+        new_password = graphene.String(required=True)
+
+    def mutate(self, info, email, otp, new_password):
+        try:
+            success, message = services.reset_pin(email, otp, new_password, request=info.context)
+        except ratelimit.RateLimitExceeded:
+            return ResetPasswordWithOtp(success=False, message=services.GENERIC_RATE_LIMITED)
+        return ResetPasswordWithOtp(success=success, message=message)
+
+
+class ChangePassword(graphene.Mutation):
+    """Deprecated alias of changePin; accepts legacy `currentPassword`/`newPassword`."""
+    success = graphene.Boolean()
+    message = graphene.String()
+
+    class Arguments:
+        current_password = graphene.String(required=True)
+        new_password = graphene.String(required=True)
+
+    @login_required
+    def mutate(self, info, current_password, new_password):
+        success, message = services.change_pin(
+            info.context.user, current_password, new_password, request=info.context
+        )
+        return ChangePassword(success=success, message=message)
+
 
 class AdminQuery(graphene.ObjectType):
     users_by_role = graphene.List(UserType, role=graphene.String(required=True))
@@ -297,6 +280,7 @@ class AdminQuery(graphene.ObjectType):
     @login_required
     @admin_required
     def resolve_all_otps(self, info):
+        # Returns only non-sensitive OTP metadata (see OTPType).
         return PasswordResetOTP.objects.all()
 
 
@@ -352,9 +336,16 @@ class AccountsQuery(graphene.ObjectType):
 class AccountsMutation(graphene.ObjectType):
     create_user = CreateUser.Field()
     approve_station_owner = ApproveStationOwner.Field()
+
+    # Canonical PIN mutations.
     send_pin_reset_otp = SendPinResetOtp.Field()
     reset_pin_with_otp = ResetPinWithOtp.Field()
     change_pin = ChangePin.Field()
+
+    # Deprecated password-named aliases (backward compatibility).
+    send_password_reset_otp = SendPasswordResetOtp.Field()
+    reset_password_with_otp = ResetPasswordWithOtp.Field()
+    change_password = ChangePassword.Field()
 
     token_auth = CustomObtainJSONWebToken.Field()
     verify_token = graphql_jwt.Verify.Field()

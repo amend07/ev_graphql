@@ -8,7 +8,9 @@ from django.conf.urls.static import static
 
 urlpatterns = [
     path('admin/', admin.site.urls),
-    path("graphql/", FileUploadGraphQLView.as_view(graphiql=True)),
+    # GraphiQL (interactive explorer) is enabled only in DEBUG; production
+    # serves the endpoint without the browsable UI.
+    path("graphql/", FileUploadGraphQLView.as_view(graphiql=settings.DEBUG)),
 ]
 
 # Serve media files during development
