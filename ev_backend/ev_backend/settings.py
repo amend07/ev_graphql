@@ -97,21 +97,15 @@ DATABASES = {
 }
 
 
-# Password validation
-# https://docs.djangoproject.com/en/5.2/ref/settings/#auth-password-validators
+# Credential (PIN) validation
+# The authentication credential is a 6-digit numeric PIN. The default Django
+# validators (MinimumLengthValidator >= 8, NumericPasswordValidator) would
+# reject a valid PIN, so the PIN policy is the single configured validator.
+# It still runs through Django's password hasher — the PIN is never stored raw.
 
 AUTH_PASSWORD_VALIDATORS = [
     {
-        'NAME': 'django.contrib.auth.password_validation.UserAttributeSimilarityValidator',
-    },
-    {
-        'NAME': 'django.contrib.auth.password_validation.MinimumLengthValidator',
-    },
-    {
-        'NAME': 'django.contrib.auth.password_validation.CommonPasswordValidator',
-    },
-    {
-        'NAME': 'django.contrib.auth.password_validation.NumericPasswordValidator',
+        'NAME': 'accounts.validators.SixDigitPINValidator',
     },
 ]
 
