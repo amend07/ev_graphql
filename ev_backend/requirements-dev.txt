@@ -1,0 +1,7 @@
+# Development / CI tooling. Install with: pip install -r requirements-dev.txt
+-r requirements.txt
+
+ruff==0.8.4          # linting
+bandit==1.8.0        # security static analysis
+pip-audit==2.7.3     # dependency vulnerability scanning
+coverage==7.6.9      # test coverage

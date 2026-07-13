@@ -13,8 +13,9 @@ urlpatterns = [
     # safe error masking are applied by HardenedGraphQLView.
     path("graphql/", HardenedGraphQLView.as_view(graphiql=settings.DEBUG)),
 
-    # Operational endpoints (Part 7).
+    # Operational endpoints (Part 6/7).
     path("health/", health.health),
+    path("live/", health.liveness),
     path("ready/", health.readiness),
     path("version/", health.version),
 ]
