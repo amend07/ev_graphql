@@ -217,3 +217,29 @@ LOGGING = {
         },
     },
 }
+
+# ---------------------------------------------------------------------------
+# Sprint 4 — Business rules, validation & limits (all configurable)
+# ---------------------------------------------------------------------------
+
+# Booking (Part 2)
+BOOKING_MIN_DURATION_MINUTES = config('BOOKING_MIN_DURATION_MINUTES', default=15, cast=int)
+BOOKING_MAX_DURATION_HOURS = config('BOOKING_MAX_DURATION_HOURS', default=4, cast=int)
+# Owners booking their own station is disallowed by default (business rule).
+BOOKING_ALLOW_OWNER_SELF_BOOKING = config('BOOKING_ALLOW_OWNER_SELF_BOOKING', default=False, cast=bool)
+
+# Station (Part 3) — upper bounds for sanity/DoS protection.
+STATION_MAX_DESCRIPTION_LENGTH = config('STATION_MAX_DESCRIPTION_LENGTH', default=2000, cast=int)
+STATION_MAX_POWER_KW = config('STATION_MAX_POWER_KW', default=1000, cast=int)
+STATION_MAX_PRICE_PER_KWH = config('STATION_MAX_PRICE_PER_KWH', default=10000, cast=int)
+STATION_MAX_CHARGERS = config('STATION_MAX_CHARGERS', default=1000, cast=int)
+# Optional allow-list of charger types; empty = accept any non-blank value
+# (keeps compatibility with values the Flutter client already sends).
+STATION_CHARGER_TYPES = [t for t in config('STATION_CHARGER_TYPES', default='').split(',') if t.strip()]
+
+# Review (Part 4)
+REVIEW_MIN_RATING = 1
+REVIEW_MAX_RATING = 5
+REVIEW_MAX_COMMENT_LENGTH = config('REVIEW_MAX_COMMENT_LENGTH', default=1000, cast=int)
+# Require a completed ("done") booking before a user may review a station.
+REVIEW_REQUIRE_COMPLETED_BOOKING = config('REVIEW_REQUIRE_COMPLETED_BOOKING', default=True, cast=bool)

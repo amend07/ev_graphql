@@ -1,12 +1,28 @@
 import graphene
 from graphene_file_upload.scalars import Upload
 from graphene_django import DjangoObjectType
-from .models import Favorite, Review, Station
-from graphql_jwt.decorators import login_required
-from accounts.permission import station_owner_required
-from django.db.models import Avg
+from django.conf import settings
+from django.db import IntegrityError
 from django.db.models import Avg, Count, Exists, OuterRef, Value
 from django.db.models.functions import Coalesce
+from graphql_jwt.decorators import login_required
+
+from .models import Favorite, Review, Station
+from .validators import (
+    InvalidInput,
+    validate_station_input,
+    validate_rating,
+    validate_comment,
+)
+from accounts.permission import station_owner_required, active_required
+
+# Scalar Station fields accepted from input; used to build create/update payloads
+# without ever passing an explicit None (which would clobber model defaults).
+STATION_FIELDS = [
+    "name", "contact_info", "description", "location", "latitude", "longitude",
+    "availability", "amenities", "charger_type", "station_count", "num_of_charger",
+    "power_output_kw", "estimated_time_min", "price_per_kwh", "charger_brand",
+]
 
 
 class StationType(DjangoObjectType):
@@ -16,13 +32,13 @@ class StationType(DjangoObjectType):
     class Meta:
         model = Station
         fields = '__all__'
-        
+
     def resolve_num_of_reviews(self, info):
         return self.reviews.count()
 
     def resolve_average_rating(self, info):
         return self.reviews.aggregate(avg_rating=Avg("rating"))["avg_rating"] or 0.0
-    
+
     def resolve_is_favorite(self, info):
         user = info.context.user
         if user.is_authenticated:
@@ -62,6 +78,11 @@ class StationListType(graphene.ObjectType):
     image = graphene.String()
 
 
+def _input_to_data(input):
+    """Provided (non-None) scalar fields only, so model defaults still apply."""
+    return {f: getattr(input, f) for f in STATION_FIELDS if getattr(input, f, None) is not None}
+
+
 class CreateStation(graphene.Mutation):
     station = graphene.Field(StationType)
 
@@ -73,26 +94,23 @@ class CreateStation(graphene.Mutation):
     @station_owner_required
     def mutate(self, info, input, image=None):
         user = info.context.user
-        station = Station.objects.create(
-            owner=user,
-            name=input.name,
-            contact_info=input.contact_info,
-            description=input.description,
-            location=input.location,
-            latitude=input.latitude,
-            longitude=input.longitude,
-            availability=input.availability,
-            amenities=input.amenities,
-            charger_type=input.charger_type,
-            station_count=input.station_count,
-            num_of_charger=input.num_of_charger,
-            power_output_kw=input.power_output_kw,
-            estimated_time_min=input.estimated_time_min,
-            price_per_kwh=input.price_per_kwh,
-            charger_brand=input.charger_brand,
-            image=image 
-        )
+        data = _input_to_data(input)
+
+        try:
+            validate_station_input(data, partial=False)
+        except InvalidInput as e:
+            raise Exception(str(e))
+
+        # Prevent obvious duplicates for the same owner.
+        if Station.objects.filter(
+            owner=user, name__iexact=data["name"],
+            location__iexact=data["location"], is_active=True,
+        ).exists():
+            raise Exception("You already have a station with this name at this location.")
+
+        station = Station.objects.create(owner=user, image=image, **data)
         return CreateStation(station=station)
+
 
 class UpdateStation(graphene.Mutation):
     station = graphene.Field(StationType)
@@ -101,6 +119,7 @@ class UpdateStation(graphene.Mutation):
         station_id = graphene.ID(required=True)
         input = CreateStationInput(required=False)
         image = Upload(required=False)
+
     @login_required
     @station_owner_required
     def mutate(self, info, station_id, input=None, image=None):
@@ -112,7 +131,12 @@ class UpdateStation(graphene.Mutation):
             raise Exception("Station not found or not owned by you.")
 
         if input:
-            for field, value in input.items():
+            data = _input_to_data(input)
+            try:
+                validate_station_input(data, partial=True)
+            except InvalidInput as e:
+                raise Exception(str(e))
+            for field, value in data.items():
                 setattr(station, field, value)
 
         if image:
@@ -120,6 +144,7 @@ class UpdateStation(graphene.Mutation):
 
         station.save()
         return UpdateStation(station=station)
+
 
 class DeleteStation(graphene.Mutation):
     ok = graphene.Boolean()
@@ -131,9 +156,22 @@ class DeleteStation(graphene.Mutation):
     @station_owner_required
     def mutate(self, info, stationId):
         user = info.context.user
-        station = Station.objects.get(id=stationId, owner=user)
-        station.delete()
+        try:
+            station = Station.objects.get(id=stationId, owner=user)
+        except Station.DoesNotExist:
+            raise Exception("Station not found or not owned by you.")
+        # Soft delete: preserve booking/review history and hide from listings.
+        if station.is_active:
+            station.is_active = False
+            station.save(update_fields=["is_active"])
         return DeleteStation(ok=True)
+
+
+class ReviewType(DjangoObjectType):
+    class Meta:
+        model = Review
+        fields = '__all__'
+
 
 class CreateReview(graphene.Mutation):
     review = graphene.Field(lambda: ReviewType)
@@ -144,24 +182,97 @@ class CreateReview(graphene.Mutation):
         comment = graphene.String()
 
     @login_required
+    @active_required
     def mutate(self, info, station_id, rating, comment=""):
         user = info.context.user
-        station = Station.objects.get(id=station_id)
+
+        try:
+            validate_rating(rating)
+            validate_comment(comment)
+        except InvalidInput as e:
+            raise Exception(str(e))
+
+        try:
+            station = Station.objects.get(id=station_id)
+        except Station.DoesNotExist:
+            raise Exception("Station not found")
+
+        if not station.is_active:
+            raise Exception("This station is not available for review.")
+        if station.owner_id == user.id:
+            raise Exception("You cannot review your own station.")
+
+        if settings.REVIEW_REQUIRE_COMPLETED_BOOKING:
+            from bookings.models import Booking
+            if not Booking.objects.filter(user=user, station=station, status="done").exists():
+                raise Exception("You can only review a station after completing a booking there.")
 
         if Review.objects.filter(user=user, station=station).exists():
             raise Exception("You have already reviewed this station.")
 
-        review = Review.objects.create(
-            user=user,
-            station=station,
-            rating=rating,
-            comment=comment
-        )
+        try:
+            review = Review.objects.create(
+                user=user, station=station, rating=rating, comment=comment or "",
+            )
+        except IntegrityError:
+            # Unique constraint lost a race — surface the same clean message.
+            raise Exception("You have already reviewed this station.")
         return CreateReview(review=review)
-class ReviewType(DjangoObjectType):
-    class Meta:
-        model = Review
-        fields = '__all__'
+
+
+class UpdateReview(graphene.Mutation):
+    review = graphene.Field(lambda: ReviewType)
+
+    class Arguments:
+        review_id = graphene.ID(required=True)
+        rating = graphene.Int()
+        comment = graphene.String()
+
+    @login_required
+    @active_required
+    def mutate(self, info, review_id, rating=None, comment=None):
+        user = info.context.user
+        try:
+            review = Review.objects.get(id=review_id)
+        except Review.DoesNotExist:
+            raise Exception("Review not found")
+
+        if review.user_id != user.id:
+            raise Exception("You can only edit your own review.")
+
+        try:
+            if rating is not None:
+                validate_rating(rating)
+                review.rating = rating
+            if comment is not None:
+                validate_comment(comment)
+                review.comment = comment
+        except InvalidInput as e:
+            raise Exception(str(e))
+
+        review.save()
+        return UpdateReview(review=review)
+
+
+class DeleteReview(graphene.Mutation):
+    ok = graphene.Boolean()
+
+    class Arguments:
+        review_id = graphene.ID(required=True)
+
+    @login_required
+    @active_required
+    def mutate(self, info, review_id):
+        user = info.context.user
+        try:
+            review = Review.objects.get(id=review_id)
+        except Review.DoesNotExist:
+            raise Exception("Review not found")
+        if review.user_id != user.id:
+            raise Exception("You can only delete your own review.")
+        review.delete()
+        return DeleteReview(ok=True)
+
 
 class ToggleFavoriteStation(graphene.Mutation):
     success = graphene.Boolean()
@@ -171,6 +282,7 @@ class ToggleFavoriteStation(graphene.Mutation):
         station_id = graphene.ID(required=True)
 
     @login_required
+    @active_required
     def mutate(self, info, station_id):
         user = info.context.user
         try:
@@ -178,10 +290,17 @@ class ToggleFavoriteStation(graphene.Mutation):
         except Station.DoesNotExist:
             return ToggleFavoriteStation(success=False, message="Station not found")
 
-        favorite, created = Favorite.objects.get_or_create(user=user, station=station)
-        if not created:
-            favorite.delete()
+        existing = Favorite.objects.filter(user=user, station=station).first()
+        if existing:
+            existing.delete()
             return ToggleFavoriteStation(success=True, message="Removed from favourites")
+
+        # Only allow favouriting an available station.
+        if not station.is_active:
+            return ToggleFavoriteStation(success=False, message="Station is not available")
+
+        # get_or_create + the unique constraint make this duplicate-safe.
+        Favorite.objects.get_or_create(user=user, station=station)
         return ToggleFavoriteStation(success=True, message="Added to favourites")
 
 
@@ -190,6 +309,8 @@ class StationMutation(graphene.ObjectType):
     update_station = UpdateStation.Field()
     delete_station = DeleteStation.Field()
     create_review = CreateReview.Field()
+    update_review = UpdateReview.Field()
+    delete_review = DeleteReview.Field()
     toggle_favorite_station = ToggleFavoriteStation.Field()
 
 
@@ -284,11 +405,11 @@ class StationQuery(graphene.ObjectType):
             )
             for s in stations
         ]
-    
+
     @login_required
     def resolve_my_stations(self, info):
         user = info.context.user
-        
+
         stations = Station.objects.filter(owner=user, is_active=True).annotate(
             num_of_rate=Count('reviews'),
             average_rate=Coalesce(Avg('reviews__rating'), 0.0)
@@ -320,6 +441,6 @@ class StationQuery(graphene.ObjectType):
 
     def resolve_station_by_id(self, info, station_id):
         try:
-            return Station.objects.get(id=station_id)
+            return Station.objects.select_related("owner").get(id=station_id)
         except Station.DoesNotExist:
             raise Exception("Station not found")

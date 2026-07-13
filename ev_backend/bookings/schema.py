@@ -1,11 +1,14 @@
 import graphene
 from graphene_django import DjangoObjectType
-from .models import Booking
-from graphql_jwt.decorators import login_required
-from stations.models import Station
-from accounts.permission import station_owner_required
+from django.conf import settings
+from django.db import transaction
 from django.utils import timezone
 from datetime import timedelta
+from graphql_jwt.decorators import login_required
+
+from .models import Booking
+from stations.models import Station
+from accounts.permission import station_owner_required, active_required
 
 
 class BookingType(DjangoObjectType):
@@ -23,47 +26,54 @@ class CreateBooking(graphene.Mutation):
         end_time = graphene.DateTime(required=True)
 
     @login_required
+    @active_required
     def mutate(self, info, station_id, start_time, end_time):
         user = info.context.user
+        now = timezone.now()
 
-        try:
-            station = Station.objects.get(pk=station_id)
-        except Station.DoesNotExist:
-            raise Exception("Station not found")
-
-        if start_time >= end_time:
+        # --- time validation (independent of the station row) ---
+        if start_time <= now:
+            raise Exception("Start time must be in the future")
+        if end_time <= start_time:
             raise Exception("End time must be after start time")
 
-        if end_time < timezone.now():
-            raise Exception("Cannot book in the past")
-
         duration = end_time - start_time
-        if duration < timedelta(minutes=15):
-            raise Exception("Minimum booking duration is 15 minutes")
-        if duration > timedelta(hours=4):
-            raise Exception("Maximum booking duration is 4 hours")
+        min_minutes = settings.BOOKING_MIN_DURATION_MINUTES
+        max_hours = settings.BOOKING_MAX_DURATION_HOURS
+        if duration < timedelta(minutes=min_minutes):
+            raise Exception(f"Minimum booking duration is {min_minutes} minutes")
+        if duration > timedelta(hours=max_hours):
+            raise Exception(f"Maximum booking duration is {max_hours} hours")
 
-        overlap = Booking.objects.filter(
-            station=station,
-            status__in=["pending", "approved"],
-            start_time__lt=end_time,
-            end_time__gt=start_time,
-        )
-        if overlap.exists():
-            taken = overlap.first()
-            raise Exception(
-                f"Time slot overlaps with an existing booking "
-                f"from {taken.start_time.strftime('%H:%M')} "
-                f"to {taken.end_time.strftime('%H:%M')}"
+        # --- station + availability, serialised per station to avoid races ---
+        with transaction.atomic():
+            try:
+                station = Station.objects.select_for_update().get(pk=station_id)
+            except Station.DoesNotExist:
+                raise Exception("Station not found")
+
+            if not station.is_active:
+                raise Exception("This station is not available for booking")
+
+            if station.owner_id == user.id and not settings.BOOKING_ALLOW_OWNER_SELF_BOOKING:
+                raise Exception("You cannot book your own station")
+
+            overlapping = Booking.objects.filter(
+                station=station,
+                status__in=Booking.ACTIVE_STATUSES,
+                start_time__lt=end_time,
+                end_time__gt=start_time,
+            ).count()
+            if overlapping >= station.num_of_charger:
+                raise Exception("No chargers are available for the selected time slot")
+
+            booking = Booking.objects.create(
+                user=user,
+                station=station,
+                start_time=start_time,
+                end_time=end_time,
+                status="pending",
             )
-
-        booking = Booking.objects.create(
-            user=user,
-            station=station,
-            start_time=start_time,
-            end_time=end_time,
-            status="pending",
-        )
         return CreateBooking(booking=booking)
 
 
@@ -80,24 +90,31 @@ class UpdateBookingStatus(graphene.Mutation):
     def mutate(self, info, booking_id, status, cancel_reason=None):
         user = info.context.user
 
-        try:
-            booking = Booking.objects.get(id=booking_id)
-        except Booking.DoesNotExist:
-            raise Exception("Booking not found")
+        # Owners may approve/reject a pending booking or mark an approved
+        # booking as completed.
+        if status not in ("approved", "rejected", "done"):
+            raise Exception("Invalid status. Must be approved, rejected, or done")
 
-        if booking.station.owner != user:
-            raise Exception("You do not own this station")
+        with transaction.atomic():
+            try:
+                booking = (
+                    Booking.objects.select_for_update()
+                    .select_related("station")
+                    .get(id=booking_id)
+                )
+            except Booking.DoesNotExist:
+                raise Exception("Booking not found")
 
-        if booking.status not in ["pending"]:
-            raise Exception("Only pending bookings can be updated")
+            if booking.station.owner_id != user.id:
+                raise Exception("You do not own this station")
 
-        if status not in ["approved", "rejected"]:
-            raise Exception("Invalid status. Must be approved or rejected")
+            if not booking.can_transition_to(status):
+                raise Exception(f"Cannot change a {booking.status} booking to {status}")
 
-        booking.status = status
-        if status == "rejected" and cancel_reason:
-            booking.cancel_reason = cancel_reason
-        booking.save()
+            booking.status = status
+            if status == "rejected" and cancel_reason:
+                booking.cancel_reason = cancel_reason
+            booking.save(update_fields=["status", "cancel_reason"])
 
         return UpdateBookingStatus(booking=booking)
 
@@ -110,23 +127,25 @@ class CancelBooking(graphene.Mutation):
         cancel_reason = graphene.String()
 
     @login_required
+    @active_required
     def mutate(self, info, booking_id, cancel_reason=None):
         user = info.context.user
 
-        try:
-            booking = Booking.objects.get(id=booking_id)
-        except Booking.DoesNotExist:
-            raise Exception("Booking not found")
+        with transaction.atomic():
+            try:
+                booking = Booking.objects.select_for_update().get(id=booking_id)
+            except Booking.DoesNotExist:
+                raise Exception("Booking not found")
 
-        if booking.user != user:
-            raise Exception("You can only cancel your own bookings")
+            if booking.user_id != user.id:
+                raise Exception("You can only cancel your own bookings")
 
-        if booking.status in ["cancelled", "done"]:
-            raise Exception("Cannot cancel a completed or already cancelled booking")
+            if not booking.can_transition_to("cancelled"):
+                raise Exception("Cannot cancel a completed or already cancelled booking")
 
-        booking.status = "cancelled"
-        booking.cancel_reason = cancel_reason or "Cancelled by user"
-        booking.save()
+            booking.status = "cancelled"
+            booking.cancel_reason = cancel_reason or "Cancelled by user"
+            booking.save(update_fields=["status", "cancel_reason"])
 
         return CancelBooking(booking=booking)
 
@@ -135,13 +154,17 @@ class BookingQuery(graphene.ObjectType):
     my_bookings = graphene.List(BookingType, status=graphene.String())
     station_bookings = graphene.List(
         BookingType,
-        booking_id=graphene.ID(required=True),
+        booking_id=graphene.ID(required=True),  # station id (kept for API compatibility)
         status=graphene.String(),
     )
 
     @login_required
     def resolve_my_bookings(self, info, status=None):
-        qs = Booking.objects.filter(user=info.context.user).order_by("-start_time")
+        qs = (
+            Booking.objects.filter(user=info.context.user)
+            .select_related("station", "station__owner")
+            .order_by("-start_time")
+        )
         if status:
             qs = qs.filter(status=status)
         return qs
@@ -155,10 +178,14 @@ class BookingQuery(graphene.ObjectType):
         except Station.DoesNotExist:
             raise Exception("Station not found")
 
-        if station.owner != user:
+        if station.owner_id != user.id:
             raise Exception("You do not own this station")
 
-        qs = Booking.objects.filter(station=station).order_by("-start_time")
+        qs = (
+            Booking.objects.filter(station=station)
+            .select_related("user", "station")
+            .order_by("-start_time")
+        )
         if status:
             qs = qs.filter(status=status)
         return qs
