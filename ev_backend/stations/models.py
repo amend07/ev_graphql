@@ -37,6 +37,7 @@ class Station(models.Model):
     class Meta:
         indexes = [
             models.Index(fields=["is_active"], name="station_is_active_idx"),
+            models.Index(fields=["owner", "is_active"], name="station_owner_active_idx"),
         ]
         constraints = [
             models.CheckConstraint(

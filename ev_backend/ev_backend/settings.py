@@ -243,3 +243,24 @@ REVIEW_MAX_RATING = 5
 REVIEW_MAX_COMMENT_LENGTH = config('REVIEW_MAX_COMMENT_LENGTH', default=1000, cast=int)
 # Require a completed ("done") booking before a user may review a station.
 REVIEW_REQUIRE_COMPLETED_BOOKING = config('REVIEW_REQUIRE_COMPLETED_BOOKING', default=True, cast=bool)
+
+# ---------------------------------------------------------------------------
+# Sprint 5 — Scalability, reliability & performance
+# ---------------------------------------------------------------------------
+
+APP_VERSION = config('APP_VERSION', default='1.0.0')
+
+# Pagination (Part 2)
+GRAPHQL_DEFAULT_PAGE_SIZE = config('GRAPHQL_DEFAULT_PAGE_SIZE', default=20, cast=int)
+GRAPHQL_MAX_PAGE_SIZE = config('GRAPHQL_MAX_PAGE_SIZE', default=100, cast=int)
+# Hard cap for the legacy (unpaginated) list fields so no query is ever unbounded.
+GRAPHQL_LIST_HARD_CAP = config('GRAPHQL_LIST_HARD_CAP', default=500, cast=int)
+
+# Query complexity protection (Part 5)
+GRAPHQL_MAX_DEPTH = config('GRAPHQL_MAX_DEPTH', default=12, cast=int)
+# Reject oversized request bodies before parsing (bytes). Also guards file uploads.
+DATA_UPLOAD_MAX_MEMORY_SIZE = config('DATA_UPLOAD_MAX_MEMORY_SIZE', default=5 * 1024 * 1024, cast=int)
+DATA_UPLOAD_MAX_NUMBER_FIELDS = config('DATA_UPLOAD_MAX_NUMBER_FIELDS', default=1000, cast=int)
+
+# Caching (Part 6) — public station list only; never user-specific data.
+STATION_LIST_CACHE_SECONDS = config('STATION_LIST_CACHE_SECONDS', default=30, cast=int)

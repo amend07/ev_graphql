@@ -9,12 +9,30 @@ from graphql_jwt.decorators import login_required
 from .models import Booking
 from stations.models import Station
 from accounts.permission import station_owner_required, active_required
+from ev_backend.pagination import paginate, hard_cap, clamp_page_size, clamp_offset
 
 
 class BookingType(DjangoObjectType):
     class Meta:
         model = Booking
         fields = "__all__"
+
+
+class BookingPage(graphene.ObjectType):
+    items = graphene.List(BookingType)
+    total_count = graphene.Int()
+    has_next = graphene.Boolean()
+
+
+def _my_bookings_qs(user, status=None):
+    qs = (
+        Booking.objects.filter(user=user)
+        .select_related("station", "station__owner")
+        .order_by("-start_time")
+    )
+    if status:
+        qs = qs.filter(status=status)
+    return qs
 
 
 class CreateBooking(graphene.Mutation):
@@ -151,27 +169,38 @@ class CancelBooking(graphene.Mutation):
 
 
 class BookingQuery(graphene.ObjectType):
-    my_bookings = graphene.List(BookingType, status=graphene.String())
+    my_bookings = graphene.List(
+        BookingType, status=graphene.String(),
+        limit=graphene.Int(), offset=graphene.Int(),
+    )
     station_bookings = graphene.List(
         BookingType,
         booking_id=graphene.ID(required=True),  # station id (kept for API compatibility)
         status=graphene.String(),
+        limit=graphene.Int(), offset=graphene.Int(),
+    )
+    # Proper paginated endpoint with a total count (Part 2).
+    my_bookings_page = graphene.Field(
+        BookingPage, status=graphene.String(),
+        limit=graphene.Int(), offset=graphene.Int(),
     )
 
     @login_required
-    def resolve_my_bookings(self, info, status=None):
-        qs = (
-            Booking.objects.filter(user=info.context.user)
-            .select_related("station", "station__owner")
-            .order_by("-start_time")
-        )
-        if status:
-            qs = qs.filter(status=status)
-        return qs
+    def resolve_my_bookings(self, info, status=None, limit=None, offset=None):
+        qs = _my_bookings_qs(info.context.user, status)
+        if limit is not None:
+            start = clamp_offset(offset)
+            return qs[start:start + clamp_page_size(limit)]
+        return hard_cap(qs)
+
+    @login_required
+    def resolve_my_bookings_page(self, info, status=None, limit=None, offset=None):
+        items, total, has_next = paginate(_my_bookings_qs(info.context.user, status), limit, offset)
+        return BookingPage(items=items, total_count=total, has_next=has_next)
 
     @login_required
     @station_owner_required
-    def resolve_station_bookings(self, info, booking_id, status=None):
+    def resolve_station_bookings(self, info, booking_id, status=None, limit=None, offset=None):
         user = info.context.user
         try:
             station = Station.objects.get(id=booking_id)
@@ -188,7 +217,10 @@ class BookingQuery(graphene.ObjectType):
         )
         if status:
             qs = qs.filter(status=status)
-        return qs
+        if limit is not None:
+            start = clamp_offset(offset)
+            return qs[start:start + clamp_page_size(limit)]
+        return hard_cap(qs)
 
 
 class BookingMutation(graphene.ObjectType):

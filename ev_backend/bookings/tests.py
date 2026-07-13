@@ -210,3 +210,17 @@ class BookingQueries(BookingTestBase):
         stranger = make_user("owner2", role="station_owner")
         res = self.client.execute(q, variables={"id": str(self.station.id)}, context=self.ctx(stranger))
         self.assertIsNotNone(res.get("errors"))
+
+    def test_my_bookings_page_totalcount_and_limit(self):
+        for i in range(3):
+            Booking.objects.create(
+                user=self.driver, station=self.station, status="pending",
+                start_time=timezone.now() + timedelta(hours=i + 1),
+                end_time=timezone.now() + timedelta(hours=i + 2),
+            )
+        q = "query($l:Int){ myBookingsPage(limit:$l){ items { id } totalCount hasNext } }"
+        res = self.client.execute(q, variables={"l": 2}, context=self.ctx(self.driver))
+        page = res["data"]["myBookingsPage"]
+        self.assertEqual(page["totalCount"], 3)
+        self.assertEqual(len(page["items"]), 2)
+        self.assertTrue(page["hasNext"])

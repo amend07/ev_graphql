@@ -1,16 +1,22 @@
 from django.contrib import admin
 from django.urls import path
-from django.views.decorators.csrf import csrf_exempt
-from graphene_file_upload.django import FileUploadGraphQLView
-from graphene_django.views import GraphQLView
 from django.conf import settings
 from django.conf.urls.static import static
+
+from .graphql_view import HardenedGraphQLView
+from . import health
 
 urlpatterns = [
     path('admin/', admin.site.urls),
     # GraphiQL (interactive explorer) is enabled only in DEBUG; production
-    # serves the endpoint without the browsable UI.
-    path("graphql/", FileUploadGraphQLView.as_view(graphiql=settings.DEBUG)),
+    # serves the endpoint without the browsable UI. Depth-limit validation and
+    # safe error masking are applied by HardenedGraphQLView.
+    path("graphql/", HardenedGraphQLView.as_view(graphiql=settings.DEBUG)),
+
+    # Operational endpoints (Part 7).
+    path("health/", health.health),
+    path("ready/", health.readiness),
+    path("version/", health.version),
 ]
 
 # Serve media files during development

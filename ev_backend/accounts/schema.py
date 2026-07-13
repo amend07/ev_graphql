@@ -12,6 +12,7 @@ from .permission import admin_required
 from .models import User, PasswordResetOTP
 from . import services, ratelimit
 from .auth_logging import log_event
+from ev_backend.pagination import hard_cap
 
 User = get_user_model()
 
@@ -26,7 +27,9 @@ class UserType(DjangoObjectType):
     favorites = graphene.List(lambda: StationType)
 
     def resolve_favorites(self, info):
-        return Station.objects.filter(favorited_by__user=self)
+        # Bounded so this nested list can never be unbounded; use myFavorites
+        # (paginated) for the full set.
+        return hard_cap(Station.objects.filter(favorited_by__user=self))
 
     def resolve_is_station_owner(self, info):
         return self.role == "station_owner"
