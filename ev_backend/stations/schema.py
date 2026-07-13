@@ -14,7 +14,16 @@ from .validators import (
     validate_rating,
     validate_comment,
 )
+from .cache import get_public_station_rows
 from accounts.permission import station_owner_required, active_required
+from ev_backend.pagination import paginate, hard_cap, clamp_page_size, clamp_offset
+
+# Row keys shared between the cached station list and StationListType.
+_ROW_KEYS = (
+    "station_id", "name", "latitude", "longitude", "charger_type",
+    "num_of_charger", "num_of_rate", "average_rate", "power_output_kw",
+    "price_per_kwh", "image",
+)
 
 # Scalar Station fields accepted from input; used to build create/update payloads
 # without ever passing an explicit None (which would clobber model defaults).
@@ -76,6 +85,36 @@ class StationListType(graphene.ObjectType):
     price_per_kwh = graphene.String()
     is_favorite = graphene.Boolean()
     image = graphene.String()
+
+
+class StationPage(graphene.ObjectType):
+    items = graphene.List(StationListType)
+    total_count = graphene.Int()
+    has_next = graphene.Boolean()
+
+
+class ReviewPage(graphene.ObjectType):
+    items = graphene.List(lambda: ReviewType)
+    total_count = graphene.Int()
+    has_next = graphene.Boolean()
+
+
+def _station_to_list_type(s, is_favorite=None):
+    """Map an annotated Station instance to StationListType (avoids duplication)."""
+    return StationListType(
+        station_id=s.id,
+        name=s.name,
+        latitude=s.latitude,
+        longitude=s.longitude,
+        charger_type=s.charger_type,
+        num_of_charger=s.num_of_charger,
+        num_of_rate=getattr(s, "num_of_rate", 0),
+        average_rate=round(getattr(s, "average_rate", 0.0), 1),
+        power_output_kw=s.power_output_kw,
+        price_per_kwh=str(s.price_per_kwh),
+        is_favorite=getattr(s, "is_favorite", False) if is_favorite is None else is_favorite,
+        image=s.image.url if s.image else "",
+    )
 
 
 def _input_to_data(input):
@@ -314,130 +353,140 @@ class StationMutation(graphene.ObjectType):
     toggle_favorite_station = ToggleFavoriteStation.Field()
 
 
-class StationQuery(graphene.ObjectType):
-    station_list = graphene.List(StationListType)
-    filter_stations = graphene.List(
-        StationListType,
+def _annotated_stations(user):
+    """Active stations annotated with review stats and (auth) is_favorite."""
+    qs = Station.objects.filter(is_active=True).annotate(
+        num_of_rate=Count("reviews"),
+        average_rate=Coalesce(Avg("reviews__rating"), 0.0),
+    )
+    if user.is_authenticated:
+        favorite = Favorite.objects.filter(user=user, station=OuterRef("pk"))
+        return qs.annotate(is_favorite=Exists(favorite))
+    return qs.annotate(is_favorite=Value(False))
+
+
+def _apply_station_filters(qs, charger_type, num_of_charger, min_rating, min_power, max_power):
+    if charger_type:
+        qs = qs.filter(charger_type__icontains=charger_type)
+    if num_of_charger:
+        qs = qs.filter(num_of_charger=num_of_charger)
+    if min_rating is not None:
+        qs = qs.filter(average_rate__gte=min_rating)
+    if min_power is not None:
+        qs = qs.filter(power_output_kw__gte=min_power)
+    if max_power is not None:
+        qs = qs.filter(power_output_kw__lte=max_power)
+    return qs
+
+
+def _window(qs, limit, offset):
+    """Apply an explicit page window when requested, else the legacy hard cap."""
+    if limit is not None:
+        start = clamp_offset(offset)
+        return qs[start:start + clamp_page_size(limit)]
+    return hard_cap(qs)
+
+
+def _station_filter_args():
+    # Fresh argument instances per field (graphene must not share mounted args).
+    return dict(
         charger_type=graphene.String(),
         num_of_charger=graphene.Int(),
         min_rating=graphene.Float(),
         min_power=graphene.Float(),
-        max_power=graphene.Float()
+        max_power=graphene.Float(),
+        limit=graphene.Int(),
+        offset=graphene.Int(),
     )
+
+
+class StationQuery(graphene.ObjectType):
+    station_list = graphene.List(StationListType, limit=graphene.Int(), offset=graphene.Int())
+    filter_stations = graphene.List(StationListType, **_station_filter_args())
     station_by_id = graphene.Field(StationType, station_id=graphene.ID(required=True))
-    my_stations = graphene.List(StationListType)
+    my_stations = graphene.List(StationListType, limit=graphene.Int(), offset=graphene.Int())
 
-    def resolve_station_list(self, info):
+    # Proper paginated endpoints with a total count (Part 2).
+    stations_page = graphene.Field(StationPage, **_station_filter_args())
+    station_reviews = graphene.Field(
+        ReviewPage, station_id=graphene.ID(required=True),
+        limit=graphene.Int(), offset=graphene.Int(),
+    )
+    my_favorites = graphene.Field(StationPage, limit=graphene.Int(), offset=graphene.Int())
+
+    def resolve_station_list(self, info, limit=None, offset=None):
+        # Served from the cached public list; is_favorite overlaid per user.
         user = info.context.user
-
-        stations = Station.objects.filter(is_active=True).annotate(
-            num_of_rate=Count('reviews'),
-            average_rate=Coalesce(Avg('reviews__rating'), 0.0)
-        )
-
+        rows = get_public_station_rows()
+        fav_ids = set()
         if user.is_authenticated:
-            favorite_subquery = Favorite.objects.filter(
-                user=user,
-                station=OuterRef('pk')
+            fav_ids = set(
+                Favorite.objects.filter(user=user).values_list("station_id", flat=True)
             )
-            stations = stations.annotate(is_favorite=Exists(favorite_subquery))
-        else:
-            stations = stations.annotate(is_favorite=Value(False))
-
+        start = clamp_offset(offset)
+        size = clamp_page_size(limit) if limit is not None else settings.GRAPHQL_LIST_HARD_CAP
+        window = rows[start:start + size]
         return [
             StationListType(
-                station_id=station.id,
-                name=station.name,
-                latitude=station.latitude,
-                longitude=station.longitude,
-                charger_type=station.charger_type,
-                num_of_charger=station.num_of_charger,
-                num_of_rate=station.num_of_rate,
-                average_rate=round(station.average_rate, 1),
-                power_output_kw=station.power_output_kw,
-                price_per_kwh=str(station.price_per_kwh),
-                is_favorite=getattr(station, 'is_favorite', False),
-                image=station.image.url if station.image else ''
+                **{k: r[k] for k in _ROW_KEYS},
+                is_favorite=(r["station_id"] in fav_ids),
             )
-            for station in stations
+            for r in window
         ]
 
     def resolve_filter_stations(self, info, charger_type=None, num_of_charger=None,
-                            min_rating=None, min_power=None, max_power=None):
-        user = info.context.user
-
-        stations = Station.objects.filter(is_active=True).annotate(
-            num_of_rate=Count('reviews'),
-            average_rate=Coalesce(Avg('reviews__rating'), 0.0)
+                                min_rating=None, min_power=None, max_power=None,
+                                limit=None, offset=None):
+        qs = _apply_station_filters(
+            _annotated_stations(info.context.user),
+            charger_type, num_of_charger, min_rating, min_power, max_power,
         )
-
-        if user.is_authenticated:
-            favorite_subquery = Favorite.objects.filter(user=user, station=OuterRef('pk'))
-            stations = stations.annotate(is_favorite=Exists(favorite_subquery))
-        else:
-            stations = stations.annotate(is_favorite=Value(False))
-
-        if charger_type:
-            stations = stations.filter(charger_type__icontains=charger_type)
-        if num_of_charger:
-            stations = stations.filter(num_of_charger=num_of_charger)
-        if min_rating is not None:
-            stations = stations.filter(average_rate__gte=min_rating)
-        if min_power is not None:
-            stations = stations.filter(power_output_kw__gte=min_power)
-        if max_power is not None:
-            stations = stations.filter(power_output_kw__lte=max_power)
-
-        return [
-            StationListType(
-                station_id=s.id,
-                name=s.name,
-                latitude=s.latitude,
-                longitude=s.longitude,
-                charger_type=s.charger_type,
-                num_of_charger=s.num_of_charger,
-                num_of_rate=s.num_of_rate,
-                average_rate=round(s.average_rate, 1),
-                power_output_kw=s.power_output_kw,
-                price_per_kwh=str(s.price_per_kwh),
-                is_favorite=False if not user.is_authenticated else getattr(s, 'is_favorite', False),
-                image=s.image.url if s.image else ''
-            )
-            for s in stations
-        ]
+        return [_station_to_list_type(s) for s in _window(qs, limit, offset)]
 
     @login_required
-    def resolve_my_stations(self, info):
+    def resolve_my_stations(self, info, limit=None, offset=None):
         user = info.context.user
+        qs = Station.objects.filter(owner=user, is_active=True).annotate(
+            num_of_rate=Count("reviews"),
+            average_rate=Coalesce(Avg("reviews__rating"), 0.0),
+            is_favorite=Exists(Favorite.objects.filter(user=user, station=OuterRef("pk"))),
+        )
+        return [_station_to_list_type(s) for s in _window(qs, limit, offset)]
 
-        stations = Station.objects.filter(owner=user, is_active=True).annotate(
-            num_of_rate=Count('reviews'),
-            average_rate=Coalesce(Avg('reviews__rating'), 0.0)
+    def resolve_stations_page(self, info, charger_type=None, num_of_charger=None,
+                              min_rating=None, min_power=None, max_power=None,
+                              limit=None, offset=None):
+        qs = _apply_station_filters(
+            _annotated_stations(info.context.user),
+            charger_type, num_of_charger, min_rating, min_power, max_power,
+        ).order_by("id")
+        items, total, has_next = paginate(qs, limit, offset)
+        return StationPage(
+            items=[_station_to_list_type(s) for s in items],
+            total_count=total, has_next=has_next,
         )
 
-        favorite_subquery = Favorite.objects.filter(
-            user=user,
-            station=OuterRef('pk')
+    def resolve_station_reviews(self, info, station_id, limit=None, offset=None):
+        qs = (
+            Review.objects.filter(station_id=station_id)
+            .select_related("user")
+            .order_by("-created_at")
         )
-        stations = stations.annotate(is_favorite=Exists(favorite_subquery))
+        items, total, has_next = paginate(qs, limit, offset)
+        return ReviewPage(items=items, total_count=total, has_next=has_next)
 
-        return [
-            StationListType(
-                station_id=station.id,
-                name=station.name,
-                latitude=station.latitude,
-                longitude=station.longitude,
-                charger_type=station.charger_type,
-                num_of_charger=station.num_of_charger,
-                num_of_rate=station.num_of_rate,
-                average_rate=round(station.average_rate, 1),
-                power_output_kw=station.power_output_kw,
-                price_per_kwh=str(station.price_per_kwh),
-                is_favorite=getattr(station, 'is_favorite', False),
-                image=station.image.url if station.image else ''
-            )
-            for station in stations
-        ]
+    @login_required
+    def resolve_my_favorites(self, info, limit=None, offset=None):
+        user = info.context.user
+        qs = Station.objects.filter(favorited_by__user=user, is_active=True).annotate(
+            num_of_rate=Count("reviews"),
+            average_rate=Coalesce(Avg("reviews__rating"), 0.0),
+        ).order_by("-id")
+        items, total, has_next = paginate(qs, limit, offset)
+        return StationPage(
+            items=[_station_to_list_type(s, is_favorite=True) for s in items],
+            total_count=total, has_next=has_next,
+        )
 
     def resolve_station_by_id(self, info, station_id):
         try:
