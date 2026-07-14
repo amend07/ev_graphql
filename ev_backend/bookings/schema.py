@@ -16,6 +16,10 @@ class BookingType(DjangoObjectType):
     class Meta:
         model = Booking
         fields = "__all__"
+        # Return `status` as its raw lowercase value ("pending", "approved", …)
+        # instead of graphene-django's auto-generated UPPERCASE choice enum.
+        # The mobile client and these tests depend on the lowercase contract.
+        convert_choices_to_enum = False
 
 
 class BookingPage(graphene.ObjectType):

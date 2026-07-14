@@ -63,4 +63,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Build production image
-        run: docker build -t ev-backend:ci ev_backend
+        # The workflow default working-directory is already `ev_backend`, so the
+        # build context is `.` (using `ev_backend` here resolved to
+        # ev_backend/ev_backend, which has no Dockerfile).
+        run: docker build -t ev-backend:ci .
