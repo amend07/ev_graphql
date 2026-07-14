@@ -23,6 +23,10 @@ class UserType(DjangoObjectType):
     class Meta:
         model = User
         exclude = ("password",)  # credential hash is never exposed
+        # Return `role` as its raw lowercase value ("user", "station_owner",
+        # "admin") rather than graphene-django's UPPERCASE choice enum — the
+        # mobile client parses the lowercase strings.
+        convert_choices_to_enum = False
 
     favorites = graphene.List(lambda: StationType)
 

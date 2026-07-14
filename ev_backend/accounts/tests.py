@@ -6,6 +6,7 @@ configuration/expiration, invalid credentials, backward-compatible aliases,
 and the guarantee that credentials/OTPs are hashed and never exposed.
 """
 
+import secrets
 from datetime import timedelta
 from unittest import mock
 
@@ -183,7 +184,19 @@ class OtpModelTests(TestCase):
         self.user = make_user("fay", "fay@x.com")
 
     def test_generation_is_hashed_random_and_emailed(self):
-        with mock.patch("accounts.models.secrets.choice", side_effect=list("246810")):
+        # Make only the OTP-code digits deterministic. `secrets` is a shared
+        # module, so patching its `choice` also intercepts Django's
+        # make_password() salt generation — delegate any non-digit alphabet
+        # (i.e. the salt) back to the real RNG so it isn't starved.
+        real_choice = secrets.choice
+        digits = iter("246810")
+
+        def fake_choice(alphabet):
+            if alphabet == "0123456789":
+                return next(digits)
+            return real_choice(alphabet)
+
+        with mock.patch("accounts.models.secrets.choice", side_effect=fake_choice):
             otp = PasswordResetOTP.generate_for_user(self.user)
         # Stored value is a hash, not the code; the code verifies against it.
         self.assertNotEqual(otp.otp_hash, "246810")
