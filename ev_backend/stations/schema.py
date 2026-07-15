@@ -3,9 +3,9 @@ from graphene_file_upload.scalars import Upload
 from graphene_django import DjangoObjectType
 from django.conf import settings
 from django.db import IntegrityError
-from django.db.models import Avg, Count, Exists, OuterRef, Value
-from django.db.models.functions import Coalesce
-from .models import Favorite, Review, Station
+from django.db.models import Avg, Exists, OuterRef, Q, Value
+from . import administration
+from .models import Favorite, Review, Station, review_stats
 from .validators import (
     InvalidInput,
     validate_station_input,
@@ -15,6 +15,7 @@ from .validators import (
 from .cache import get_public_station_rows
 from accounts.permission import (
     active_required,
+    admin_required,
     login_required,
     public,
     station_owner_required,
@@ -86,10 +87,14 @@ class StationType(DjangoObjectType):
         return _public_user(self.owner)
 
     def resolve_num_of_reviews(self, info):
-        return self.reviews.count()
+        # Hidden reviews do not count (B2.1): a moderated review that still moves
+        # the station's rating has not been moderated, only made harder to read.
+        return self.reviews.filter(is_hidden=False).count()
 
     def resolve_average_rating(self, info):
-        return self.reviews.aggregate(avg_rating=Avg("rating"))["avg_rating"] or 0.0
+        return self.reviews.filter(is_hidden=False).aggregate(
+            avg_rating=Avg("rating"),
+        )["avg_rating"] or 0.0
 
     def resolve_is_favorite(self, info):
         user = info.context.user
@@ -399,12 +404,311 @@ class StationMutation(graphene.ObjectType):
     toggle_favorite_station = ToggleFavoriteStation.Field()
 
 
+# ── Administration (Sprint B2.1) ─────────────────────────────────────────────
+#
+# Everything below is admin-gated. The public types above are reused where the
+# audience genuinely sees the same thing (a station is public data; an admin
+# needs no narrower view of it), and a separate type is introduced only where the
+# audience differs — `AdminReviewType` publishes moderation state and the station
+# a review belongs to, neither of which the public `ReviewType` should carry.
+
+
+class AdminStationPage(graphene.ObjectType):
+    items = graphene.List(StationType)
+    total_count = graphene.Int()
+    has_next = graphene.Boolean()
+
+
+class AdminReviewType(graphene.ObjectType):
+    """A review as a moderator sees it: the content, its author, and its state.
+
+    Separate from `ReviewType` for two reasons, both rule 3:
+
+    * it publishes `is_hidden`, which is moderation state the public read has no
+      business carrying (there it would be constant `false` — every hidden review
+      is already filtered out);
+    * it publishes `station`, which `ReviewType` deliberately omits because a
+      public review is only ever reached *through* a station. A moderation queue
+      is the opposite: it spans stations, so a row that cannot say which station
+      it belongs to is unusable.
+
+    Hand-rolled rather than a second `DjangoObjectType` over `Review` so it does
+    not overwrite `ReviewType` in graphene-django's per-model registry.
+    """
+
+    id = graphene.ID(required=True)
+    rating = graphene.Int(required=True)
+    comment = graphene.String(required=True)
+    created_at = graphene.DateTime(required=True)
+    is_hidden = graphene.Boolean(required=True)
+    user = graphene.Field(PublicUserType, required=True)
+    station = graphene.Field(StationType, required=True)
+
+
+class AdminReviewPage(graphene.ObjectType):
+    items = graphene.List(AdminReviewType)
+    total_count = graphene.Int()
+    has_next = graphene.Boolean()
+
+
+def _admin_review(review):
+    return AdminReviewType(
+        id=review.id,
+        rating=review.rating,
+        comment=review.comment,
+        created_at=review.created_at,
+        is_hidden=review.is_hidden,
+        user=_public_user(review.user),
+        station=review.station,
+    )
+
+
+# Ordering allow-lists. Never interpolate a caller's string into `order_by`: on
+# the user directory that would let someone sort by `password` and read the hash
+# out one comparison at a time. The same discipline applies here even though
+# these models hold no secret — the rule is the protection, not the model.
+STATION_ADMIN_ORDER_FIELDS = {
+    'newest': '-created_at',
+    'oldest': 'created_at',
+    'name': 'name',
+    'rating': '-average_rate',
+}
+
+REVIEW_ORDER_FIELDS = {
+    'newest': '-created_at',
+    'oldest': 'created_at',
+    'rating_high': '-rating',
+    'rating_low': 'rating',
+}
+
+
+class StationAdminQuery(graphene.ObjectType):
+    stations_page_admin = graphene.Field(
+        AdminStationPage,
+        search=graphene.String(),
+        owner_id=graphene.ID(),
+        is_active=graphene.Boolean(),
+        charger_type=graphene.String(),
+        min_rating=graphene.Float(),
+        order_by=graphene.String(),
+        limit=graphene.Int(),
+        offset=graphene.Int(),
+        description=(
+            "Every station, INCLUDING inactive ones — unlike the public "
+            "stationsPage, which only ever shows active stations. Admin only. "
+            "search matches name, location or owner username."
+        ),
+    )
+    reviews_page = graphene.Field(
+        AdminReviewPage,
+        station_id=graphene.ID(),
+        owner_id=graphene.ID(),
+        customer_id=graphene.ID(),
+        rating=graphene.Int(),
+        is_hidden=graphene.Boolean(),
+        search=graphene.String(),
+        order_by=graphene.String(),
+        limit=graphene.Int(),
+        offset=graphene.Int(),
+        description=(
+            "Review moderation queue. Sees hidden reviews too; filter "
+            "isHidden: false for the queue of live reviews. Admin only."
+        ),
+    )
+
+    @admin_required
+    def resolve_stations_page_admin(self, info, search=None, owner_id=None,
+                                    is_active=None, charger_type=None,
+                                    min_rating=None, order_by=None,
+                                    limit=None, offset=None):
+        # No `is_active=True` filter: seeing what has been taken down is the
+        # point of the admin view, and B1's "no reactivation path" deviation
+        # existed partly because nothing could list an inactive station at all.
+        qs = Station.objects.select_related("owner").annotate(**review_stats())
+
+        if owner_id:
+            qs = qs.filter(owner_id=owner_id)
+        if is_active is not None:
+            qs = qs.filter(is_active=is_active)
+        if charger_type:
+            qs = qs.filter(charger_type__icontains=charger_type)
+        if min_rating is not None:
+            qs = qs.filter(average_rate__gte=min_rating)
+        if search:
+            term = search.strip()
+            if term:
+                qs = qs.filter(
+                    Q(name__icontains=term)
+                    | Q(location__icontains=term)
+                    | Q(owner__username__icontains=term)
+                )
+
+        ordering = STATION_ADMIN_ORDER_FIELDS.get(order_by or 'newest', '-created_at')
+        # Tie-broken on the primary key: `created_at` collides for rows seeded in
+        # the same instant, and an unstable sort drops or repeats rows across
+        # pages (rule 5).
+        qs = qs.order_by(ordering, 'id')
+
+        items, total, has_next = paginate(qs, limit, offset)
+        return AdminStationPage(items=items, total_count=total, has_next=has_next)
+
+    @admin_required
+    def resolve_reviews_page(self, info, station_id=None, owner_id=None,
+                             customer_id=None, rating=None, is_hidden=None,
+                             search=None, order_by=None, limit=None, offset=None):
+        qs = Review.objects.select_related("user", "station", "station__owner")
+
+        if station_id:
+            qs = qs.filter(station_id=station_id)
+        if owner_id:
+            qs = qs.filter(station__owner_id=owner_id)
+        if customer_id:
+            qs = qs.filter(user_id=customer_id)
+        if rating is not None:
+            qs = qs.filter(rating=rating)
+        if is_hidden is not None:
+            qs = qs.filter(is_hidden=is_hidden)
+        if search:
+            term = search.strip()
+            if term:
+                # The comment is what a moderator is usually hunting for — a
+                # reported phrase — plus the author and station to reach it from
+                # a complaint naming either.
+                qs = qs.filter(
+                    Q(comment__icontains=term)
+                    | Q(user__username__icontains=term)
+                    | Q(station__name__icontains=term)
+                )
+
+        ordering = REVIEW_ORDER_FIELDS.get(order_by or 'newest', '-created_at')
+        qs = qs.order_by(ordering, 'id')
+
+        items, total, has_next = paginate(qs, limit, offset)
+        return AdminReviewPage(
+            items=[_admin_review(r) for r in items],
+            total_count=total, has_next=has_next,
+        )
+
+
+class ActivateStation(graphene.Mutation):
+    """Bring a station back into service.
+
+    Closes B1's known deviation: a station taken down (by its owner's soft-delete
+    or by an admin) had no route back short of database access.
+    """
+
+    station = graphene.Field(StationType)
+
+    class Arguments:
+        station_id = graphene.ID(required=True)
+        reason = graphene.String()
+
+    @admin_required
+    def mutate(self, info, station_id, reason=None):
+        station = administration.get_station(station_id)
+        station = administration.set_station_active(
+            actor=info.context.user, station=station, is_active=True,
+            reason=reason, request=info.context,
+        )
+        return ActivateStation(station=station)
+
+
+class DeactivateStation(graphene.Mutation):
+    """Withdraw a station from discovery and block new bookings.
+
+    Existing bookings are left alone — see `set_station_active`.
+    """
+
+    station = graphene.Field(StationType)
+
+    class Arguments:
+        station_id = graphene.ID(required=True)
+        reason = graphene.String()
+
+    @admin_required
+    def mutate(self, info, station_id, reason=None):
+        station = administration.get_station(station_id)
+        station = administration.set_station_active(
+            actor=info.context.user, station=station, is_active=False,
+            reason=reason, request=info.context,
+        )
+        return DeactivateStation(station=station)
+
+
+class HideReview(graphene.Mutation):
+    """Remove a review from every public read and from its station's rating."""
+
+    review = graphene.Field(AdminReviewType)
+
+    class Arguments:
+        review_id = graphene.ID(required=True)
+        reason = graphene.String()
+
+    @admin_required
+    def mutate(self, info, review_id, reason=None):
+        review = administration.get_review(review_id)
+        review = administration.set_review_hidden(
+            actor=info.context.user, review=review, is_hidden=True,
+            reason=reason, request=info.context,
+        )
+        return HideReview(review=_admin_review(review))
+
+
+class RestoreReview(graphene.Mutation):
+    """Un-hide a review. The reason hiding is preferred over deleting."""
+
+    review = graphene.Field(AdminReviewType)
+
+    class Arguments:
+        review_id = graphene.ID(required=True)
+        reason = graphene.String()
+
+    @admin_required
+    def mutate(self, info, review_id, reason=None):
+        review = administration.get_review(review_id)
+        review = administration.set_review_hidden(
+            actor=info.context.user, review=review, is_hidden=False,
+            reason=reason, request=info.context,
+        )
+        return RestoreReview(review=_admin_review(review))
+
+
+class AdminDeleteReview(graphene.Mutation):
+    """Destroy someone else's review. Irreversible; a reason is required.
+
+    Named `adminDeleteReview`, NOT `deleteReview`: `deleteReview` already exists
+    and is the author-only mutation both clients call. Reusing the name would
+    either break those clients or, worse, silently widen an author-only action
+    into an admin one on a field they already have documents for.
+    """
+
+    ok = graphene.Boolean()
+
+    class Arguments:
+        review_id = graphene.ID(required=True)
+        reason = graphene.String(required=True)
+
+    @admin_required
+    def mutate(self, info, review_id, reason):
+        review = administration.get_review(review_id)
+        administration.delete_review(
+            actor=info.context.user, review=review, reason=reason,
+            request=info.context,
+        )
+        return AdminDeleteReview(ok=True)
+
+
+class StationAdminMutation(graphene.ObjectType):
+    activate_station = ActivateStation.Field()
+    deactivate_station = DeactivateStation.Field()
+    hide_review = HideReview.Field()
+    restore_review = RestoreReview.Field()
+    admin_delete_review = AdminDeleteReview.Field()
+
+
 def _annotated_stations(user):
     """Active stations annotated with review stats and (auth) is_favorite."""
-    qs = Station.objects.filter(is_active=True).annotate(
-        num_of_rate=Count("reviews"),
-        average_rate=Coalesce(Avg("reviews__rating"), 0.0),
-    )
+    qs = Station.objects.filter(is_active=True).annotate(**review_stats())
     if user.is_authenticated:
         favorite = Favorite.objects.filter(user=user, station=OuterRef("pk"))
         return qs.annotate(is_favorite=Exists(favorite))
@@ -495,9 +799,8 @@ class StationQuery(graphene.ObjectType):
     def resolve_my_stations(self, info, limit=None, offset=None):
         user = info.context.user
         qs = Station.objects.filter(owner=user, is_active=True).annotate(
-            num_of_rate=Count("reviews"),
-            average_rate=Coalesce(Avg("reviews__rating"), 0.0),
             is_favorite=Exists(Favorite.objects.filter(user=user, station=OuterRef("pk"))),
+            **review_stats(),
         )
         return [_station_to_list_type(s) for s in _window(qs, limit, offset)]
 
@@ -517,10 +820,13 @@ class StationQuery(graphene.ObjectType):
 
     @public
     def resolve_station_reviews(self, info, station_id, limit=None, offset=None):
+        # `Review.visible()` — a hidden review is gone from the public read, not
+        # merely flagged in it (B2.1).
         qs = (
-            Review.objects.filter(station_id=station_id)
+            Review.visible()
+            .filter(station_id=station_id)
             .select_related("user")
-            .order_by("-created_at")
+            .order_by("-created_at", "-id")
         )
         items, total, has_next = paginate(qs, limit, offset)
         return ReviewPage(items=items, total_count=total, has_next=has_next)
@@ -528,10 +834,9 @@ class StationQuery(graphene.ObjectType):
     @login_required
     def resolve_my_favorites(self, info, limit=None, offset=None):
         user = info.context.user
-        qs = Station.objects.filter(favorited_by__user=user, is_active=True).annotate(
-            num_of_rate=Count("reviews"),
-            average_rate=Coalesce(Avg("reviews__rating"), 0.0),
-        ).order_by("-id")
+        qs = Station.objects.filter(
+            favorited_by__user=user, is_active=True,
+        ).annotate(**review_stats()).order_by("-id")
         items, total, has_next = paginate(qs, limit, offset)
         return StationPage(
             items=[_station_to_list_type(s, is_favorite=True) for s in items],

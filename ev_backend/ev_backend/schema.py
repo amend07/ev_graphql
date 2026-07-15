@@ -5,8 +5,13 @@ from accounts.schema import (
     AdminQuery,
     AdminMutation,
 )
-from stations.schema import StationMutation, StationQuery
-from bookings.schema import BookingMutation, BookingQuery
+from stations.schema import (
+    StationAdminMutation,
+    StationAdminQuery,
+    StationMutation,
+    StationQuery,
+)
+from bookings.schema import BookingAdminQuery, BookingMutation, BookingQuery
 
 
 class Query(
@@ -14,6 +19,8 @@ class Query(
     StationQuery,
     BookingQuery,
     AdminQuery,
+    StationAdminQuery,
+    BookingAdminQuery,
     graphene.ObjectType,
 ):
     pass
@@ -24,6 +31,7 @@ class Mutation(
     StationMutation,
     BookingMutation,
     AdminMutation,
+    StationAdminMutation,
     graphene.ObjectType,
 ):
     token_auth = AccountsMutation.token_auth

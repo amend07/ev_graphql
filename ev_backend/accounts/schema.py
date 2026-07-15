@@ -11,6 +11,10 @@ from .models import AuditLog, PasswordResetOTP
 from . import administration, services, ratelimit
 from .auth_logging import log_event
 from ev_backend.pagination import hard_cap, paginate
+# `stations.schema` imports `accounts.permission`, never `accounts.schema`, so
+# this direction does not cycle. PublicUserType is the identity-only audience
+# type shared by every "someone else's user" field in the API.
+from stations.schema import PublicUserType, StationType
 
 User = get_user_model()
 
@@ -34,6 +38,12 @@ class UserType(DjangoObjectType):
     """
 
     is_station_owner = graphene.Boolean()
+    # Narrowed on purpose (B2.1): the reviewer is another admin, and this field
+    # is readable by the owner they decided on via `me`. A rejected applicant
+    # should learn that a decision was taken and by whom, not the deciding
+    # admin's email address. Auto-conversion would have made this a full
+    # `UserType` — the exact widening rule 3 exists to prevent.
+    reviewer = graphene.Field(PublicUserType)
 
     class Meta:
         model = User
@@ -42,6 +52,10 @@ class UserType(DjangoObjectType):
             "id", "username", "email",
             # Authorization/state — clients route on role, W3 lists status.
             "role", "is_active", "owner_status",
+            # Owner-decision provenance (B2.1). `rejectionReason` is what a
+            # rejected owner is shown; `reviewedAt` is nullable because a
+            # decision may never have been taken (or predates the field).
+            "reviewed_at", "rejection_reason",
             # Administrative context, only reachable through the gated roots above.
             "is_staff", "is_superuser", "date_joined", "last_login",
         )
@@ -52,6 +66,12 @@ class UserType(DjangoObjectType):
 
     def resolve_is_station_owner(self, info):
         return self.role == "station_owner"
+
+    def resolve_reviewer(self, info):
+        return (
+            PublicUserType(id=self.reviewer.id, username=self.reviewer.username)
+            if self.reviewer_id else None
+        )
 
 
 class OTPType(DjangoObjectType):
@@ -331,6 +351,54 @@ class AuditLogPage(graphene.ObjectType):
     has_next = graphene.Boolean()
 
 
+class DashboardSummaryType(graphene.ObjectType):
+    """The admin dashboard, in one query and four aggregates.
+
+    Every number here is computed by the database from data the platform
+    actually holds. There is no revenue, no utilisation, no growth rate and no
+    conversion figure, because `Booking` carries no money and no price snapshot:
+    each of those would have to be fabricated, and a fabricated number on a
+    dashboard is indistinguishable from a real one at a glance. See the sprint
+    report for the list of what a future Payment model would unlock.
+    """
+
+    customers = graphene.Int(required=True)
+    owners = graphene.Int(required=True)
+    pending_owners = graphene.Int(
+        required=True, description="Station owners awaiting an approval decision.",
+    )
+    rejected_owners = graphene.Int(required=True)
+
+    stations = graphene.Int(required=True)
+    active_stations = graphene.Int(required=True)
+    inactive_stations = graphene.Int(required=True)
+
+    bookings_today = graphene.Int(
+        required=True,
+        description=(
+            "Bookings CREATED since local midnight — platform volume, not "
+            "bookings whose slot is today. bookingsPage(dateFrom/dateTo) filters "
+            "the slot instead."
+        ),
+    )
+    bookings_this_week = graphene.Int(
+        required=True, description="Bookings created since Monday 00:00 local.",
+    )
+    bookings_this_month = graphene.Int(
+        required=True, description="Bookings created since the 1st, 00:00 local.",
+    )
+
+    reviews = graphene.Int(
+        required=True, description="Visible reviews. Hidden ones are excluded.",
+    )
+    average_rating = graphene.Float(
+        required=True, description="Mean of visible review ratings; 0.0 when there are none.",
+    )
+
+    newest_users = graphene.List(graphene.NonNull(UserType), required=True)
+    newest_stations = graphene.List(graphene.NonNull(StationType), required=True)
+
+
 # Ordering allow-list for usersPage. A free-form order_by would let a caller sort
 # by `password` and read the hash out one comparison at a time.
 USER_ORDER_FIELDS = {
@@ -338,6 +406,13 @@ USER_ORDER_FIELDS = {
     'oldest': 'date_joined',
     'username': 'username',
     'last_login': '-last_login',
+}
+
+# Same discipline for the audit trail (B2.1).
+AUDIT_ORDER_FIELDS = {
+    'newest': '-created_at',
+    'oldest': 'created_at',
+    'action': 'action',
 }
 
 
@@ -364,15 +439,31 @@ class AdminQuery(graphene.ObjectType):
     all_otps = graphene.List(OTPType)
     audit_logs_page = graphene.Field(
         AuditLogPage,
+        actor_id=graphene.ID(),
         action=graphene.String(),
+        target_type=graphene.String(),
         target_id=graphene.String(),
+        date_from=graphene.DateTime(),
+        date_to=graphene.DateTime(),
+        order_by=graphene.String(),
         limit=graphene.Int(),
         offset=graphene.Int(),
+        description=(
+            "The administrative audit trail. All filters are additive since B1: "
+            "actorId, targetType, dateFrom, dateTo and orderBy are new in B2.1."
+        ),
     )
     user_deletion_preview = graphene.Field(
         DeletionSummaryType,
         user_id=graphene.ID(required=True),
         description="What deleting this user would destroy. Changes nothing.",
+    )
+    dashboard_summary = graphene.Field(
+        DashboardSummaryType,
+        newest_limit=graphene.Int(
+            description="How many recent users/stations to include (1–20, default 5).",
+        ),
+        description="Platform totals for the admin dashboard, in one query.",
     )
 
     @admin_required
@@ -415,13 +506,30 @@ class AdminQuery(graphene.ObjectType):
         return hard_cap(PasswordResetOTP.objects.order_by('-created_at'))
 
     @admin_required
-    def resolve_audit_logs_page(self, info, action=None, target_id=None,
-                                limit=None, offset=None):
+    def resolve_audit_logs_page(self, info, actor_id=None, action=None,
+                                target_type=None, target_id=None, date_from=None,
+                                date_to=None, order_by=None, limit=None, offset=None):
         qs = AuditLog.objects.all()
+        if actor_id:
+            # Matches the FK, which is SET_NULL: entries whose actor has since
+            # been deleted are unreachable by this filter by construction. They
+            # are still in the trail, and `actorUsername` still names who acted —
+            # filter on `search`-less pages or by date to find them.
+            qs = qs.filter(actor_id=actor_id)
         if action:
             qs = qs.filter(action=action)
+        if target_type:
+            qs = qs.filter(target_type=target_type)
         if target_id:
             qs = qs.filter(target_id=str(target_id))
+        if date_from is not None:
+            qs = qs.filter(created_at__gte=date_from)
+        if date_to is not None:
+            qs = qs.filter(created_at__lte=date_to)
+
+        ordering = AUDIT_ORDER_FIELDS.get(order_by or 'newest', '-created_at')
+        qs = qs.order_by(ordering, '-id')  # tie-broken (rule 5)
+
         items, total, has_next = paginate(qs, limit, offset)
         return AuditLogPage(items=items, total_count=total, has_next=has_next)
 
@@ -429,6 +537,12 @@ class AdminQuery(graphene.ObjectType):
     def resolve_user_deletion_preview(self, info, user_id):
         return DeletionSummaryType(
             **administration.deletion_summary(administration.get_target(user_id))
+        )
+
+    @admin_required
+    def resolve_dashboard_summary(self, info, newest_limit=None):
+        return DashboardSummaryType(
+            **administration.platform_summary(newest_limit=newest_limit)
         )
 
 
@@ -469,15 +583,28 @@ class ToggleUserActive(graphene.Mutation):
 
 
 class RejectStationOwner(graphene.Mutation):
+    """Reject a station owner's application. The reason is now mandatory.
+
+    `reason` moved from `String` to `String!` in B2.1. That is a breaking change
+    to the argument's type and is made deliberately, while it is still free: no
+    shipped client calls this mutation yet (B1 built it; W3 has not adopted it),
+    and the web client in flight has been told to always send one. A rejection
+    nobody can account for is worse than a rejection that is slightly harder to
+    submit — the applicant has to be told something.
+    """
+
     success = graphene.Boolean()
     user = graphene.Field(UserType)
 
     class Arguments:
         user_id = graphene.ID(required=True)
-        reason = graphene.String()
+        reason = graphene.String(
+            required=True,
+            description="Why the application was rejected. Shown to the applicant.",
+        )
 
     @admin_required
-    def mutate(self, info, user_id, reason=None):
+    def mutate(self, info, user_id, reason):
         target = administration.get_target(user_id)
         user = administration.reject_owner(
             actor=info.context.user, target=target, reason=reason,

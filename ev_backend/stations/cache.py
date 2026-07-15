@@ -41,14 +41,15 @@ def get_public_station_rows():
     if rows is not None:
         return rows
 
-    from .models import Station
+    from .models import Station, review_stats
 
+    # Hidden reviews are excluded here too (B2.1). This list is cached, so a
+    # moderated review left counting here would outlive the moderation by the
+    # cache TTL on the single most-read endpoint on the platform. `post_save` on
+    # Review bumps the version key, so hiding one recomputes this immediately.
     qs = (
         Station.objects.filter(is_active=True)
-        .annotate(
-            num_of_rate=Count("reviews"),
-            average_rate=Coalesce(Avg("reviews__rating"), 0.0),
-        )
+        .annotate(**review_stats())
         .order_by("id")[: settings.GRAPHQL_LIST_HARD_CAP]
     )
 

@@ -78,3 +78,34 @@ def record_user_action(*, actor, action, target_user, request=None, **metadata):
         request=request,
         **metadata,
     )
+
+
+def record_station_action(*, actor, action, target_station, request=None, **metadata):
+    """Record an action taken against a station (Sprint B2.1)."""
+    return record(
+        actor=actor,
+        action=action,
+        target_type=AuditLog.TARGET_STATION,
+        target_id=target_station.pk,
+        target_label=target_station.name,
+        request=request,
+        **metadata,
+    )
+
+
+def record_review_action(*, actor, action, target_review, request=None, **metadata):
+    """Record a moderation action taken against a review (Sprint B2.1).
+
+    The label is the station the review is attached to, not the review's text: a
+    moderation trail has to be readable without republishing the content that was
+    moderated, which may be exactly the abuse that prompted the action.
+    """
+    return record(
+        actor=actor,
+        action=action,
+        target_type=AuditLog.TARGET_REVIEW,
+        target_id=target_review.pk,
+        target_label=target_review.station.name,
+        request=request,
+        **metadata,
+    )

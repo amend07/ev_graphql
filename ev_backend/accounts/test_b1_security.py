@@ -150,8 +150,20 @@ class UserTypeExposure(TestCase):
                 "id", "username", "email", "role", "isActive", "ownerStatus",
                 "isStaff", "isSuperuser", "dateJoined", "lastLogin",
                 "isStationOwner",
+                # B2.1 owner-decision provenance. Reviewed and added on purpose:
+                # this assertion failing is the mechanism working, so widening
+                # the list is a decision, never a way to fix a red build.
+                "reviewedAt", "rejectionReason", "reviewer",
             },
         )
+
+    def test_the_reviewing_admin_is_narrowed_to_a_public_identity(self):
+        # `reviewer` is a User FK. Left to auto-conversion it would have become a
+        # full UserType, handing the deciding admin's email to the rejected
+        # applicant who reads their own record through `me` — rule 3's exact
+        # failure mode, one hop further along.
+        reviewer = schema.graphql_schema.type_map["UserType"].fields["reviewer"]
+        self.assertEqual(reviewer.type.name, "PublicUserType")
 
     def test_user_type_never_exposes_the_credential_or_reverse_relations(self):
         fields = type_fields("UserType")

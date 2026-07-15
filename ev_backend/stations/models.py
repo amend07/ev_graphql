@@ -1,5 +1,28 @@
 from django.db import models
+from django.db.models.functions import Coalesce
 from django.conf import settings
+
+
+def review_stats():
+    """Rating annotations for a Station queryset, over VISIBLE reviews only.
+
+    One definition, used by every path that puts a rating in front of anyone: the
+    public list, the cached list, an owner's own stations, the admin console.
+    Moderation is only real if it reaches all of them, and the way that breaks is
+    a new resolver hand-rolling ``Count("reviews")`` and quietly counting the
+    hidden rows back in. Import this instead of writing that.
+
+    Lives here rather than in ``schema.py`` because it is a queryset concern and
+    because ``cache.py`` needs it too — and ``schema`` already imports ``cache``,
+    so the reverse would be a cycle.
+    """
+    return dict(
+        num_of_rate=models.Count("reviews", filter=Review.VISIBLE_FROM_STATION),
+        average_rate=Coalesce(
+            models.Avg("reviews__rating", filter=Review.VISIBLE_FROM_STATION), 0.0,
+        ),
+    )
+
 
 class Station(models.Model):
     owner = models.ForeignKey(
@@ -69,7 +92,27 @@ class Review(models.Model):
     comment = models.TextField(blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
+    # Moderation (Sprint B2.1).
+    #
+    # Hiding is reversible; deleting is not. A hidden review must be invisible in
+    # EVERY public read AND excluded from every rating aggregate — a moderated
+    # review that still moves the station's average has not been moderated, it has
+    # only been made harder to read. `visible()` is the single definition of that,
+    # so a new read path cannot forget the filter by writing its own query.
+    #
+    # Hiding deliberately does NOT free the one-review-per-user constraint: an
+    # author must not be able to evade moderation by posting the same content
+    # again. They can still edit or delete their own review, which is theirs to do.
+    is_hidden = models.BooleanField(
+        default=False,
+        help_text="Hidden by a moderator: invisible to the public and excluded from ratings.",
+    )
+
     class Meta:
+        indexes = [
+            # Every public read filters on this pair.
+            models.Index(fields=['station', 'is_hidden'], name='review_station_hidden_idx'),
+        ]
         constraints = [
             # One review per user per station (race-safe at the DB level).
             models.UniqueConstraint(
@@ -80,6 +123,16 @@ class Review(models.Model):
                 name="review_rating_range",
             ),
         ]
+
+    # Aggregation-side twin of `visible()`, for Count/Avg over a Station's
+    # `reviews` related name. Kept beside the field so the cached public list and
+    # the live resolvers cannot drift apart on what "counts".
+    VISIBLE_FROM_STATION = models.Q(reviews__is_hidden=False)
+
+    @classmethod
+    def visible(cls):
+        """Reviews the public may see. The single definition — use it everywhere."""
+        return cls.objects.filter(is_hidden=False)
 
     def __str__(self):
         return f"Review by {self.user.username} for {self.station.name} - {self.rating}"

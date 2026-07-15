@@ -46,6 +46,16 @@ QUERY_POLICY = {
     'allOtps': POLICY_ADMIN,
     'auditLogsPage': POLICY_ADMIN,
     'userDeletionPreview': POLICY_ADMIN,
+    # Admin — platform APIs (B2.1). Admin is the only defensible policy for each:
+    # `stationsPageAdmin` deliberately sees inactive stations, `bookingsPage`
+    # sees every customer's movements across the platform (the exact data the B1
+    # vulnerability leaked), `reviewsPage` sees moderated content, and
+    # `dashboardSummary` aggregates all of it.
+    'stationsPageAdmin': POLICY_ADMIN,
+    'bookingsPage': POLICY_ADMIN,
+    'bookingById': POLICY_ADMIN,
+    'reviewsPage': POLICY_ADMIN,
+    'dashboardSummary': POLICY_ADMIN,
 }
 
 MUTATION_POLICY = {
@@ -79,6 +89,18 @@ MUTATION_POLICY = {
     'rejectStationOwner': POLICY_ADMIN,
     'toggleUserActive': POLICY_ADMIN,
     'deleteUser': POLICY_ADMIN,
+    # Admin — station and review administration (B2.1).
+    #
+    # `adminDeleteReview` is NOT `deleteReview`. The latter is listed above as
+    # POLICY_ACTIVE and is author-only: it is a customer deleting their own
+    # words. Giving the admin action the same name would have collapsed two
+    # different policies onto one field, which is precisely the ambiguity this
+    # table exists to prevent.
+    'activateStation': POLICY_ADMIN,
+    'deactivateStation': POLICY_ADMIN,
+    'hideReview': POLICY_ADMIN,
+    'restoreReview': POLICY_ADMIN,
+    'adminDeleteReview': POLICY_ADMIN,
 }
 
 # The auth mutations above are `graphql_jwt`'s own or are intentionally

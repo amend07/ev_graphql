@@ -43,6 +43,35 @@ class User(AbstractUser):
         help_text="Approval state for station owners. NULL for other roles.",
     )
 
+    # Who decided, when, and why (Sprint B2.1).
+    #
+    # B1 shipped the state machine but not its provenance: `owner_status` said an
+    # application was rejected and nothing said who rejected it or on what
+    # grounds. The audit trail recorded the event, but the trail is a log — the
+    # owner's own record has to carry the outcome, because that is what the
+    # rejected owner is shown and what an admin reopening the case reads.
+    #
+    # `reviewer` is SET_NULL for the same reason `AuditLog.actor` is: an admin can
+    # be deleted, and the decision must survive them.
+    reviewer = models.ForeignKey(
+        'self',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='owner_decisions',
+        help_text="Admin who approved or rejected this station owner. NULL if never reviewed.",
+    )
+    reviewed_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="When owner_status was last decided by an admin.",
+    )
+    rejection_reason = models.TextField(
+        blank=True,
+        default='',
+        help_text="Why the owner application was rejected. Empty unless owner_status='rejected'.",
+    )
+
     def is_station_owner(self):
         """Role check only — says nothing about approval. Clients rely on this
         to route owners, so its meaning must not change."""
@@ -77,15 +106,28 @@ class AuditLog(models.Model):
     ACTION_USER_DELETED = 'user_deleted'
     ACTION_OWNER_APPROVED = 'owner_approved'
     ACTION_OWNER_REJECTED = 'owner_rejected'
+    # Sprint B2.1: station and review administration.
+    ACTION_STATION_ACTIVATED = 'station_activated'
+    ACTION_STATION_DEACTIVATED = 'station_deactivated'
+    ACTION_REVIEW_HIDDEN = 'review_hidden'
+    ACTION_REVIEW_RESTORED = 'review_restored'
+    ACTION_REVIEW_DELETED = 'review_deleted'
     ACTION_CHOICES = (
         (ACTION_USER_ACTIVATED, 'User activated'),
         (ACTION_USER_DEACTIVATED, 'User deactivated'),
         (ACTION_USER_DELETED, 'User deleted'),
         (ACTION_OWNER_APPROVED, 'Station owner approved'),
         (ACTION_OWNER_REJECTED, 'Station owner rejected'),
+        (ACTION_STATION_ACTIVATED, 'Station activated'),
+        (ACTION_STATION_DEACTIVATED, 'Station deactivated'),
+        (ACTION_REVIEW_HIDDEN, 'Review hidden'),
+        (ACTION_REVIEW_RESTORED, 'Review restored'),
+        (ACTION_REVIEW_DELETED, 'Review deleted'),
     )
 
     TARGET_USER = 'user'
+    TARGET_STATION = 'station'
+    TARGET_REVIEW = 'review'
 
     actor = models.ForeignKey(
         User, on_delete=models.SET_NULL, null=True, related_name='audit_actions',

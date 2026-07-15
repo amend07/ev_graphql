@@ -2,13 +2,20 @@ import graphene
 from graphene_django import DjangoObjectType
 from django.conf import settings
 from django.db import transaction
+from django.db.models import Q
 from django.utils import timezone
 from datetime import timedelta
 
 
 from .models import Booking
 from stations.models import Station
-from accounts.permission import active_required, login_required, station_owner_required
+from accounts.permission import (
+    active_required,
+    admin_required,
+    login_required,
+    station_owner_required,
+)
+from ev_backend.errors import NotFound
 from ev_backend.pagination import paginate, hard_cap, clamp_page_size, clamp_offset
 
 
@@ -254,3 +261,93 @@ class BookingMutation(graphene.ObjectType):
     create_booking = CreateBooking.Field()
     update_booking_status = UpdateBookingStatus.Field()
     cancel_booking = CancelBooking.Field()
+
+
+# ── Administration (Sprint B2.1) ─────────────────────────────────────────────
+#
+# Read-only, deliberately and completely. There is no admin status override, no
+# forced cancellation and no refund. `Booking` carries no money, no price
+# snapshot and no payment reference, so a refund mutation here could not do
+# anything except lie about having issued one. See the sprint report.
+
+BOOKING_ORDER_FIELDS = {
+    'newest': '-created_at',
+    'oldest': 'created_at',
+    'start_time': '-start_time',
+    'status': 'status',
+}
+
+
+class BookingAdminQuery(graphene.ObjectType):
+    bookings_page = graphene.Field(
+        BookingPage,
+        status=graphene.String(),
+        customer_id=graphene.ID(),
+        owner_id=graphene.ID(),
+        station_id=graphene.ID(),
+        date_from=graphene.DateTime(),
+        date_to=graphene.DateTime(),
+        search=graphene.String(),
+        order_by=graphene.String(),
+        limit=graphene.Int(),
+        offset=graphene.Int(),
+        description=(
+            "Every booking on the platform, read-only. Admin only. "
+            "dateFrom/dateTo filter on startTime — the booking's slot, not when "
+            "it was created. search matches customer username/email or station name."
+        ),
+    )
+    booking_by_id = graphene.Field(
+        BookingType,
+        booking_id=graphene.ID(required=True),
+        description="One booking, read-only. Admin only.",
+    )
+
+    @admin_required
+    def resolve_bookings_page(self, info, status=None, customer_id=None,
+                              owner_id=None, station_id=None, date_from=None,
+                              date_to=None, search=None, order_by=None,
+                              limit=None, offset=None):
+        qs = Booking.objects.select_related("user", "station", "station__owner")
+
+        if status:
+            qs = qs.filter(status=status)
+        if customer_id:
+            qs = qs.filter(user_id=customer_id)
+        if owner_id:
+            qs = qs.filter(station__owner_id=owner_id)
+        if station_id:
+            qs = qs.filter(station_id=station_id)
+        # Filters the slot, not the creation timestamp: an admin asking for
+        # "bookings this week" on a bookings screen means the ones happening
+        # then. dashboardSummary counts the opposite (bookings *made*). Both are
+        # documented rather than left for the caller to infer.
+        if date_from is not None:
+            qs = qs.filter(start_time__gte=date_from)
+        if date_to is not None:
+            qs = qs.filter(start_time__lte=date_to)
+        if search:
+            term = search.strip()
+            if term:
+                qs = qs.filter(
+                    Q(user__username__icontains=term)
+                    | Q(user__email__icontains=term)
+                    | Q(station__name__icontains=term)
+                )
+
+        ordering = BOOKING_ORDER_FIELDS.get(order_by or 'newest', '-created_at')
+        qs = qs.order_by(ordering, 'id')  # tie-broken (rule 5)
+
+        items, total, has_next = paginate(qs, limit, offset)
+        return BookingPage(items=items, total_count=total, has_next=has_next)
+
+    @admin_required
+    def resolve_booking_by_id(self, info, booking_id):
+        try:
+            return (
+                Booking.objects
+                .select_related("user", "station", "station__owner")
+                .get(pk=booking_id)
+            )
+        except (Booking.DoesNotExist, ValueError, TypeError):
+            raise NotFound("Booking not found.")
