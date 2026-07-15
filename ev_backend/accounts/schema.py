@@ -4,36 +4,51 @@ import graphene
 import graphql_jwt
 from graphene_django import DjangoObjectType
 from django.contrib.auth import get_user_model
-from graphql_jwt.decorators import login_required
+from django.db.models import Q
 
-from stations.models import Station
-from stations.schema import StationType
-from .permission import admin_required
-from .models import User, PasswordResetOTP
-from . import services, ratelimit
+from .permission import admin_required, login_required
+from .models import AuditLog, PasswordResetOTP
+from . import administration, services, ratelimit
 from .auth_logging import log_event
-from ev_backend.pagination import hard_cap
+from ev_backend.pagination import hard_cap, paginate
 
 User = get_user_model()
 
 
 class UserType(DjangoObjectType):
+    """A user's own record, or a user as an administrator sees them.
+
+    THE INVARIANT (B1 Phase 1): this type is only ever reachable from a root that
+    already knows the caller is the subject or an admin — `me`, `tokenAuth`,
+    `createUser` (returns the account just registered), `usersByRole`,
+    `usersPage`, and the admin mutation payloads. It is deliberately NOT used for
+    a station's owner or a review's author; those are `PublicUserType`.
+
+    That invariant is what makes the fields below safe. Break it — hang this type
+    off something public — and every one of them leaks. `test_user_type_exposure`
+    pins the field list so an accidental widening fails loudly.
+
+    `exclude` was the old approach and is why `is_superuser`, `password_reset_otp`
+    and every reverse relation were public: it published each new field by
+    default. An allow-list fails closed instead.
+    """
+
     is_station_owner = graphene.Boolean()
 
     class Meta:
         model = User
-        exclude = ("password",)  # credential hash is never exposed
-        # Return `role` as its raw lowercase value ("user", "station_owner",
-        # "admin") rather than graphene-django's UPPERCASE choice enum — the
-        # mobile client parses the lowercase strings.
+        fields = (
+            # Identity — both clients select these.
+            "id", "username", "email",
+            # Authorization/state — clients route on role, W3 lists status.
+            "role", "is_active", "owner_status",
+            # Administrative context, only reachable through the gated roots above.
+            "is_staff", "is_superuser", "date_joined", "last_login",
+        )
+        # Return `role`/`owner_status` as raw lowercase values ("user",
+        # "station_owner", "pending", …) rather than graphene-django's UPPERCASE
+        # choice enums — both clients parse the lowercase strings.
         convert_choices_to_enum = False
-
-    favorites = graphene.List(lambda: StationType)
-
-    def resolve_favorites(self, info):
-        # Bounded so this nested list can never be unbounded; use myFavorites
-        # (paginated) for the full set.
-        return hard_cap(Station.objects.filter(favorited_by__user=self))
 
     def resolve_is_station_owner(self, info):
         return self.role == "station_owner"
@@ -148,6 +163,15 @@ class CreateUser(graphene.Mutation):
 
 
 class ApproveStationOwner(graphene.Mutation):
+    """Approve a pending station owner.
+
+    Before B1 this set `is_active = True` on an account that was already active —
+    a no-op, because registration never created anything pending. It now moves
+    `owner_status` to approved, which is the flag `station_owner_required`
+    actually gates on. Same name, same arguments, same payload: existing callers
+    keep working and finally do something.
+    """
+
     success = graphene.Boolean()
     user = graphene.Field(UserType)
 
@@ -156,16 +180,10 @@ class ApproveStationOwner(graphene.Mutation):
 
     @admin_required
     def mutate(self, info, user_id):
-        try:
-            user = User.objects.get(id=user_id)
-        except User.DoesNotExist:
-            raise Exception("User not found")
-
-        if user.role != "station_owner":
-            raise Exception("Only station owners require approval")
-
-        user.is_active = True
-        user.save()
+        target = administration.get_target(user_id)
+        user = administration.approve_owner(
+            actor=info.context.user, target=target, request=info.context,
+        )
         return ApproveStationOwner(success=True, user=user)
 
 
@@ -275,37 +293,162 @@ class ChangePassword(graphene.Mutation):
         return ChangePassword(success=success, message=message)
 
 
-class AdminQuery(graphene.ObjectType):
-    users_by_role = graphene.List(UserType, role=graphene.String(required=True))
-    all_otps = graphene.List(OTPType)
+class DeletionSummaryType(graphene.ObjectType):
+    """What deleting a user destroys, counted before it happens."""
 
-    @login_required
+    stations = graphene.Int(required=True)
+    bookings = graphene.Int(required=True)
+    reviews = graphene.Int(required=True)
+    favorites = graphene.Int(required=True)
+    other_users_affected = graphene.Int(
+        required=True,
+        description=(
+            "Other people whose bookings or reviews are destroyed with this "
+            "account, because they used a station it owns."
+        ),
+    )
+
+
+class UserPage(graphene.ObjectType):
+    items = graphene.List(UserType)
+    total_count = graphene.Int()
+    has_next = graphene.Boolean()
+
+
+class AuditLogType(DjangoObjectType):
+    class Meta:
+        model = AuditLog
+        fields = (
+            "id", "actor_username", "action", "target_type", "target_id",
+            "target_label", "metadata", "ip", "created_at",
+        )
+        convert_choices_to_enum = False
+
+
+class AuditLogPage(graphene.ObjectType):
+    items = graphene.List(AuditLogType)
+    total_count = graphene.Int()
+    has_next = graphene.Boolean()
+
+
+# Ordering allow-list for usersPage. A free-form order_by would let a caller sort
+# by `password` and read the hash out one comparison at a time.
+USER_ORDER_FIELDS = {
+    'newest': '-date_joined',
+    'oldest': 'date_joined',
+    'username': 'username',
+    'last_login': '-last_login',
+}
+
+
+class AdminQuery(graphene.ObjectType):
+    users_by_role = graphene.List(
+        UserType,
+        role=graphene.String(required=True),
+        description=(
+            "DEPRECATED — use usersPage. Kept for the existing web client. "
+            "Bounded by GRAPHQL_LIST_HARD_CAP; it cannot page or search."
+        ),
+    )
+    users_page = graphene.Field(
+        UserPage,
+        role=graphene.String(),
+        search=graphene.String(),
+        is_active=graphene.Boolean(),
+        owner_status=graphene.String(),
+        order_by=graphene.String(),
+        limit=graphene.Int(),
+        offset=graphene.Int(),
+        description="Paginated, searchable, filterable user directory.",
+    )
+    all_otps = graphene.List(OTPType)
+    audit_logs_page = graphene.Field(
+        AuditLogPage,
+        action=graphene.String(),
+        target_id=graphene.String(),
+        limit=graphene.Int(),
+        offset=graphene.Int(),
+    )
+    user_deletion_preview = graphene.Field(
+        DeletionSummaryType,
+        user_id=graphene.ID(required=True),
+        description="What deleting this user would destroy. Changes nothing.",
+    )
+
     @admin_required
     def resolve_users_by_role(self, info, role):
-        return User.objects.filter(role=role)
+        # Bounded (B1 Phase 6): this was the one collection that could return the
+        # whole table. The cap is a truncation the caller cannot see, which is
+        # why it is deprecated in favour of usersPage rather than left as-is.
+        return hard_cap(User.objects.filter(role=role).order_by('id'))
 
-    @login_required
+    @admin_required
+    def resolve_users_page(self, info, role=None, search=None, is_active=None,
+                           owner_status=None, order_by=None, limit=None, offset=None):
+        qs = User.objects.all()
+
+        if role:
+            qs = qs.filter(role=role)
+        if is_active is not None:
+            qs = qs.filter(is_active=is_active)
+        if owner_status:
+            qs = qs.filter(owner_status=owner_status)
+        if search:
+            term = search.strip()
+            if term:
+                qs = qs.filter(
+                    Q(username__icontains=term) | Q(email__icontains=term)
+                )
+
+        ordering = USER_ORDER_FIELDS.get(order_by or 'newest', '-date_joined')
+        # Tie-break on the primary key: `date_joined` collides for accounts made
+        # in the same instant, and an unstable sort silently drops or repeats
+        # rows across pages.
+        qs = qs.order_by(ordering, 'id')
+
+        items, total, has_next = paginate(qs, limit, offset)
+        return UserPage(items=items, total_count=total, has_next=has_next)
+
     @admin_required
     def resolve_all_otps(self, info):
         # Returns only non-sensitive OTP metadata (see OTPType).
-        return PasswordResetOTP.objects.all()
+        return hard_cap(PasswordResetOTP.objects.order_by('-created_at'))
+
+    @admin_required
+    def resolve_audit_logs_page(self, info, action=None, target_id=None,
+                                limit=None, offset=None):
+        qs = AuditLog.objects.all()
+        if action:
+            qs = qs.filter(action=action)
+        if target_id:
+            qs = qs.filter(target_id=str(target_id))
+        items, total, has_next = paginate(qs, limit, offset)
+        return AuditLogPage(items=items, total_count=total, has_next=has_next)
+
+    @admin_required
+    def resolve_user_deletion_preview(self, info, user_id):
+        return DeletionSummaryType(
+            **administration.deletion_summary(administration.get_target(user_id))
+        )
 
 
 class DeleteUser(graphene.Mutation):
     ok = graphene.Boolean()
+    summary = graphene.Field(
+        DeletionSummaryType,
+        description="What this delete destroyed. Additive since B1.",
+    )
 
     class Arguments:
         user_id = graphene.ID(required=True)
 
-    @login_required
     @admin_required
     def mutate(self, info, user_id):
-        try:
-            user = User.objects.get(pk=user_id)
-            user.delete()
-            return DeleteUser(ok=True)
-        except User.DoesNotExist:
-            return DeleteUser(ok=False)
+        target = administration.get_target(user_id)
+        summary = administration.delete_user(
+            actor=info.context.user, target=target, request=info.context,
+        )
+        return DeleteUser(ok=True, summary=DeletionSummaryType(**summary))
 
 
 class ToggleUserActive(graphene.Mutation):
@@ -315,21 +458,38 @@ class ToggleUserActive(graphene.Mutation):
         user_id = graphene.ID(required=True)
         is_active = graphene.Boolean(required=True)
 
-    @login_required
     @admin_required
     def mutate(self, info, user_id, is_active):
-        try:
-            user = User.objects.get(pk=user_id)
-            user.is_active = is_active
-            user.save()
-            return ToggleUserActive(user=user)
-        except User.DoesNotExist:
-            raise Exception("User not found")
+        target = administration.get_target(user_id)
+        user = administration.set_user_active(
+            actor=info.context.user, target=target, is_active=is_active,
+            request=info.context,
+        )
+        return ToggleUserActive(user=user)
+
+
+class RejectStationOwner(graphene.Mutation):
+    success = graphene.Boolean()
+    user = graphene.Field(UserType)
+
+    class Arguments:
+        user_id = graphene.ID(required=True)
+        reason = graphene.String()
+
+    @admin_required
+    def mutate(self, info, user_id, reason=None):
+        target = administration.get_target(user_id)
+        user = administration.reject_owner(
+            actor=info.context.user, target=target, reason=reason,
+            request=info.context,
+        )
+        return RejectStationOwner(success=True, user=user)
 
 
 class AdminMutation(graphene.ObjectType):
     delete_user = DeleteUser.Field()
     toggle_user_active = ToggleUserActive.Field()
+    reject_station_owner = RejectStationOwner.Field()
 
 
 class AccountsQuery(graphene.ObjectType):

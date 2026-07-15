@@ -14,13 +14,101 @@ class User(AbstractUser):
         ('station_owner', 'Station Owner'),
         ('user', 'User'),
     )
+
+    # Station-owner approval lifecycle (Sprint B1, Phase 2).
+    #
+    # Deliberately NOT ``is_active``: graphql_jwt rejects an inactive user's
+    # token at decode time, so a "pending" owner modelled that way could not sign
+    # in at all — not even to see that they are pending. Keeping approval on its
+    # own field lets a pending owner use the app as a customer while station
+    # management stays closed until an admin approves them.
+    #
+    # Only meaningful for ``role='station_owner'``; NULL for everyone else.
+    OWNER_PENDING = 'pending'
+    OWNER_APPROVED = 'approved'
+    OWNER_REJECTED = 'rejected'
+    OWNER_STATUS_CHOICES = (
+        (OWNER_PENDING, 'Pending'),
+        (OWNER_APPROVED, 'Approved'),
+        (OWNER_REJECTED, 'Rejected'),
+    )
+
     role = models.CharField(max_length=20, choices=ROLE_CHOICES, default='user')
+    owner_status = models.CharField(
+        max_length=20,
+        choices=OWNER_STATUS_CHOICES,
+        null=True,
+        blank=True,
+        default=None,
+        help_text="Approval state for station owners. NULL for other roles.",
+    )
 
     def is_station_owner(self):
+        """Role check only — says nothing about approval. Clients rely on this
+        to route owners, so its meaning must not change."""
         return self.role == 'station_owner'
+
+    def is_approved_owner(self):
+        """The check that actually gates station management."""
+        return self.role == 'station_owner' and self.owner_status == self.OWNER_APPROVED
 
     def __str__(self):
         return f"{self.username} ({self.role})"
+
+
+class AuditLog(models.Model):
+    """Persistent record of administrative actions (Sprint B1, Phase 4).
+
+    Written only through :mod:`accounts.audit` — never directly from a resolver —
+    so every action is recorded the same way and nothing depends on a caller
+    remembering to log.
+
+    Two deliberate denormalisations, both so a record outlives what it describes:
+
+    * ``actor`` is SET_NULL with the username copied to ``actor_username``. An
+      admin can be deleted; the trail of what they did must not vanish with them.
+    * the target is NOT a foreign key. ``deleteUser`` is a hard cascading delete,
+      so an FK would delete the very record proving the deletion happened. The
+      type/id/label triple is a snapshot, not a live reference.
+    """
+
+    ACTION_USER_ACTIVATED = 'user_activated'
+    ACTION_USER_DEACTIVATED = 'user_deactivated'
+    ACTION_USER_DELETED = 'user_deleted'
+    ACTION_OWNER_APPROVED = 'owner_approved'
+    ACTION_OWNER_REJECTED = 'owner_rejected'
+    ACTION_CHOICES = (
+        (ACTION_USER_ACTIVATED, 'User activated'),
+        (ACTION_USER_DEACTIVATED, 'User deactivated'),
+        (ACTION_USER_DELETED, 'User deleted'),
+        (ACTION_OWNER_APPROVED, 'Station owner approved'),
+        (ACTION_OWNER_REJECTED, 'Station owner rejected'),
+    )
+
+    TARGET_USER = 'user'
+
+    actor = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, related_name='audit_actions',
+    )
+    actor_username = models.CharField(max_length=150, blank=True)
+    action = models.CharField(max_length=40, choices=ACTION_CHOICES)
+    target_type = models.CharField(max_length=40)
+    target_id = models.CharField(max_length=64)
+    target_label = models.CharField(max_length=150, blank=True)
+    metadata = models.JSONField(default=dict, blank=True)
+    ip = models.GenericIPAddressField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ('-created_at', '-id')
+        indexes = [
+            models.Index(fields=['-created_at'], name='audit_created_idx'),
+            models.Index(fields=['action'], name='audit_action_idx'),
+            models.Index(fields=['target_type', 'target_id'], name='audit_target_idx'),
+        ]
+
+    def __str__(self):
+        return f"{self.actor_username or 'system'} {self.action} {self.target_type}:{self.target_id}"
 
 
 class PasswordResetOTP(models.Model):

@@ -50,8 +50,14 @@ def create_account(username, email, pin, is_station_owner=False, request=None):
         raise CredentialError("Email already registered")
 
     role = "station_owner" if is_station_owner else "user"
+    # Station owners register as PENDING and are approved by an admin (B1 Phase
+    # 2). They stay `is_active=True` and can sign in and use the app as a
+    # customer immediately — approval gates station management, not access. Any
+    # other role has no approval state, so the field stays NULL.
+    owner_status = User.OWNER_PENDING if is_station_owner else None
     user = User.objects.create_user(
-        username=username, email=email, password=pin, role=role
+        username=username, email=email, password=pin, role=role,
+        owner_status=owner_status,
     )
     log_event("account_created", request=request, user=user, role=role)
     return user

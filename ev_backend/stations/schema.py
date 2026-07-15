@@ -5,8 +5,6 @@ from django.conf import settings
 from django.db import IntegrityError
 from django.db.models import Avg, Count, Exists, OuterRef, Value
 from django.db.models.functions import Coalesce
-from graphql_jwt.decorators import login_required
-
 from .models import Favorite, Review, Station
 from .validators import (
     InvalidInput,
@@ -15,7 +13,12 @@ from .validators import (
     validate_comment,
 )
 from .cache import get_public_station_rows
-from accounts.permission import station_owner_required, active_required
+from accounts.permission import (
+    active_required,
+    login_required,
+    public,
+    station_owner_required,
+)
 from ev_backend.pagination import paginate, hard_cap, clamp_page_size, clamp_offset
 
 # Row keys shared between the cached station list and StationListType.
@@ -34,13 +37,53 @@ STATION_FIELDS = [
 ]
 
 
+class PublicUserType(graphene.ObjectType):
+    """A user as strangers may see them: who they are, nothing more.
+
+    Used wherever a user hangs off public data — a station's owner, a review's
+    author. Before B1 these were full ``UserType`` objects, so
+    ``stationById { owner { email isSuperuser } }`` answered for anonymous
+    callers. Narrowing the type removes the reachability rather than guarding it,
+    which is the only version that cannot be forgotten.
+
+    Both clients only ever select `id`/`username` here, so this is the complete
+    set they use.
+    """
+
+    id = graphene.ID(required=True)
+    username = graphene.String(required=True)
+
+
+def _public_user(user):
+    return PublicUserType(id=user.id, username=user.username) if user else None
+
+
 class StationType(DjangoObjectType):
     num_of_reviews = graphene.Int()
     average_rating = graphene.Float()
     is_favorite = graphene.Boolean()
+    # required: Station.owner is a non-null FK, and the field was `UserType!`
+    # before B1. Narrowing the type must not quietly widen its nullability.
+    owner = graphene.Field(PublicUserType, required=True)
+
     class Meta:
         model = Station
-        fields = '__all__'
+        # Explicit allow-list (B1 Phase 1). `__all__` silently published every
+        # future field and every reverse relation — `bookings`, `reviews`,
+        # `favorited_by` — which is how a station leaked its customers' identities
+        # and movements to anonymous callers. Adding a field to the model no
+        # longer adds it to the public API.
+        fields = (
+            "id", "name", "contact_info", "description", "image", "is_active",
+            "location", "latitude", "longitude", "availability", "amenities",
+            "charger_type", "station_count", "num_of_charger", "power_output_kw",
+            "estimated_time_min", "price_per_kwh", "charger_brand", "created_at",
+        )
+
+    def resolve_owner(self, info):
+        # Narrowed on purpose: ownership is public (clients hide "Book" on your
+        # own station), the owner's contact details are not.
+        return _public_user(self.owner)
 
     def resolve_num_of_reviews(self, info):
         return self.reviews.count()
@@ -129,7 +172,6 @@ class CreateStation(graphene.Mutation):
         input = CreateStationInput(required=True)
         image = Upload(required=False)
 
-    @login_required
     @station_owner_required
     def mutate(self, info, input, image=None):
         user = info.context.user
@@ -159,7 +201,6 @@ class UpdateStation(graphene.Mutation):
         input = CreateStationInput(required=False)
         image = Upload(required=False)
 
-    @login_required
     @station_owner_required
     def mutate(self, info, station_id, input=None, image=None):
         user = info.context.user
@@ -191,7 +232,6 @@ class DeleteStation(graphene.Mutation):
     class Arguments:
         stationId = graphene.ID(required=True)
 
-    @login_required
     @station_owner_required
     def mutate(self, info, stationId):
         user = info.context.user
@@ -207,9 +247,19 @@ class DeleteStation(graphene.Mutation):
 
 
 class ReviewType(DjangoObjectType):
+    # required: Review.user is a non-null FK (was `UserType!`).
+    user = graphene.Field(PublicUserType, required=True)
+
     class Meta:
         model = Review
-        fields = '__all__'
+        # Reviews are public (anyone may read a station's reviews), so the author
+        # is narrowed to the display identity both clients actually select.
+        # `station` is omitted: reviews are only ever reached through a station,
+        # so the back-reference is dead weight and another traversal edge.
+        fields = ("id", "rating", "comment", "created_at")
+
+    def resolve_user(self, info):
+        return _public_user(self.user)
 
 
 class CreateReview(graphene.Mutation):
@@ -220,7 +270,6 @@ class CreateReview(graphene.Mutation):
         rating = graphene.Int(required=True)
         comment = graphene.String()
 
-    @login_required
     @active_required
     def mutate(self, info, station_id, rating, comment=""):
         user = info.context.user
@@ -267,7 +316,6 @@ class UpdateReview(graphene.Mutation):
         rating = graphene.Int()
         comment = graphene.String()
 
-    @login_required
     @active_required
     def mutate(self, info, review_id, rating=None, comment=None):
         user = info.context.user
@@ -299,7 +347,6 @@ class DeleteReview(graphene.Mutation):
     class Arguments:
         review_id = graphene.ID(required=True)
 
-    @login_required
     @active_required
     def mutate(self, info, review_id):
         user = info.context.user
@@ -320,7 +367,6 @@ class ToggleFavoriteStation(graphene.Mutation):
     class Arguments:
         station_id = graphene.ID(required=True)
 
-    @login_required
     @active_required
     def mutate(self, info, station_id):
         user = info.context.user
@@ -414,6 +460,7 @@ class StationQuery(graphene.ObjectType):
     )
     my_favorites = graphene.Field(StationPage, limit=graphene.Int(), offset=graphene.Int())
 
+    @public
     def resolve_station_list(self, info, limit=None, offset=None):
         # Served from the cached public list; is_favorite overlaid per user.
         user = info.context.user
@@ -434,6 +481,7 @@ class StationQuery(graphene.ObjectType):
             for r in window
         ]
 
+    @public
     def resolve_filter_stations(self, info, charger_type=None, num_of_charger=None,
                                 min_rating=None, min_power=None, max_power=None,
                                 limit=None, offset=None):
@@ -453,6 +501,7 @@ class StationQuery(graphene.ObjectType):
         )
         return [_station_to_list_type(s) for s in _window(qs, limit, offset)]
 
+    @public
     def resolve_stations_page(self, info, charger_type=None, num_of_charger=None,
                               min_rating=None, min_power=None, max_power=None,
                               limit=None, offset=None):
@@ -466,6 +515,7 @@ class StationQuery(graphene.ObjectType):
             total_count=total, has_next=has_next,
         )
 
+    @public
     def resolve_station_reviews(self, info, station_id, limit=None, offset=None):
         qs = (
             Review.objects.filter(station_id=station_id)
@@ -488,6 +538,7 @@ class StationQuery(graphene.ObjectType):
             total_count=total, has_next=has_next,
         )
 
+    @public
     def resolve_station_by_id(self, info, station_id):
         try:
             return Station.objects.select_related("owner").get(id=station_id)

@@ -12,6 +12,7 @@ import logging
 from django.db import Error as DatabaseError
 from graphene_file_upload.django import FileUploadGraphQLView
 
+from .errors import APIError
 from .graphql_validation import depth_limit_validator
 
 logger = logging.getLogger("ev_backend.graphql")
@@ -40,4 +41,16 @@ class HardenedGraphQLView(FileUploadGraphQLView):
         if original is not None and isinstance(original, _MASK_TYPES):
             logger.error("Masked GraphQL error: %r", original)
             return {"message": _GENERIC_MESSAGE}
-        return FileUploadGraphQLView.format_error(error)
+
+        formatted = FileUploadGraphQLView.format_error(error)
+
+        # Attach the stable code for typed failures (B1). Purely additive: the
+        # message is untouched, so clients that read `errors[0].message` — every
+        # current one — are unaffected, while new callers can branch on the code
+        # instead of matching prose.
+        if isinstance(original, APIError):
+            extensions = dict(formatted.get("extensions") or {})
+            extensions["code"] = original.code
+            formatted["extensions"] = extensions
+
+        return formatted

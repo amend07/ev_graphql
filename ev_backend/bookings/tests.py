@@ -27,10 +27,20 @@ mutation($id:ID!,$s:String!){ updateBookingStatus(bookingId:$id, status:$s){ boo
 """
 
 
-def make_user(username, role="user", is_active=True):
+def make_user(username, role="user", is_active=True, owner_status=None):
+    """Test user.
+
+    Station owners default to APPROVED: these suites test station and booking
+    rules, not the approval lifecycle (see accounts.tests for that), and an
+    unapproved owner is refused before any of those rules are reached. Pass
+    owner_status explicitly to exercise a pending/rejected owner.
+    """
+    if role == "station_owner" and owner_status is None:
+        owner_status = User.OWNER_APPROVED
     return User.objects.create_user(
         username=username, email=f"{username}@x.com",
         password="123456", role=role, is_active=is_active,
+        owner_status=owner_status,
     )
 
 

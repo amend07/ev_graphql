@@ -4,22 +4,49 @@ from django.conf import settings
 from django.db import transaction
 from django.utils import timezone
 from datetime import timedelta
-from graphql_jwt.decorators import login_required
+
 
 from .models import Booking
 from stations.models import Station
-from accounts.permission import station_owner_required, active_required
+from accounts.permission import active_required, login_required, station_owner_required
 from ev_backend.pagination import paginate, hard_cap, clamp_page_size, clamp_offset
 
 
+class BookingCustomerType(graphene.ObjectType):
+    """The customer on a booking, as the counterparty may see them.
+
+    Carries the email, which `PublicUserType` does not: a station owner has to be
+    able to contact the driver they just approved, and the customer sees their
+    own. Both clients select exactly these three fields.
+
+    Safe only because every route to a booking is authorization-gated —
+    `myBookings*` is self-scoped, `stationBookings` is owner-scoped, and B1
+    removed `Station.bookings`, which was the anonymous way in.
+    """
+
+    id = graphene.ID(required=True)
+    username = graphene.String(required=True)
+    email = graphene.String(required=True)
+
+
 class BookingType(DjangoObjectType):
+    # required: Booking.user is a non-null FK (was `UserType!`).
+    user = graphene.Field(BookingCustomerType, required=True)
+
     class Meta:
         model = Booking
-        fields = "__all__"
+        # Explicit allow-list (B1 Phase 1) — see StationType.
+        fields = ("id", "start_time", "end_time", "status", "cancel_reason",
+                  "created_at", "station")
         # Return `status` as its raw lowercase value ("pending", "approved", …)
         # instead of graphene-django's auto-generated UPPERCASE choice enum.
         # The mobile client and these tests depend on the lowercase contract.
         convert_choices_to_enum = False
+
+    def resolve_user(self, info):
+        return BookingCustomerType(
+            id=self.user.id, username=self.user.username, email=self.user.email,
+        )
 
 
 class BookingPage(graphene.ObjectType):
@@ -47,7 +74,6 @@ class CreateBooking(graphene.Mutation):
         start_time = graphene.DateTime(required=True)
         end_time = graphene.DateTime(required=True)
 
-    @login_required
     @active_required
     def mutate(self, info, station_id, start_time, end_time):
         user = info.context.user
@@ -107,7 +133,6 @@ class UpdateBookingStatus(graphene.Mutation):
         status = graphene.String(required=True)
         cancel_reason = graphene.String()
 
-    @login_required
     @station_owner_required
     def mutate(self, info, booking_id, status, cancel_reason=None):
         user = info.context.user
@@ -148,7 +173,6 @@ class CancelBooking(graphene.Mutation):
         booking_id = graphene.ID(required=True)
         cancel_reason = graphene.String()
 
-    @login_required
     @active_required
     def mutate(self, info, booking_id, cancel_reason=None):
         user = info.context.user
@@ -202,7 +226,6 @@ class BookingQuery(graphene.ObjectType):
         items, total, has_next = paginate(_my_bookings_qs(info.context.user, status), limit, offset)
         return BookingPage(items=items, total_count=total, has_next=has_next)
 
-    @login_required
     @station_owner_required
     def resolve_station_bookings(self, info, booking_id, status=None, limit=None, offset=None):
         user = info.context.user
