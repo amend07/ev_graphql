@@ -112,6 +112,9 @@ class AuditLog(models.Model):
     ACTION_REVIEW_HIDDEN = 'review_hidden'
     ACTION_REVIEW_RESTORED = 'review_restored'
     ACTION_REVIEW_DELETED = 'review_deleted'
+    # Sprint B3: privilege changes. Deliberately not reachable over GraphQL — see
+    # `accounts/management/commands/promote_admin.py` for why.
+    ACTION_ADMIN_PROMOTED = 'admin_promoted'
     ACTION_CHOICES = (
         (ACTION_USER_ACTIVATED, 'User activated'),
         (ACTION_USER_DEACTIVATED, 'User deactivated'),
@@ -123,6 +126,7 @@ class AuditLog(models.Model):
         (ACTION_REVIEW_HIDDEN, 'Review hidden'),
         (ACTION_REVIEW_RESTORED, 'Review restored'),
         (ACTION_REVIEW_DELETED, 'Review deleted'),
+        (ACTION_ADMIN_PROMOTED, 'Promoted to administrator'),
     )
 
     TARGET_USER = 'user'

@@ -20,7 +20,7 @@ from accounts.permission import (
     public,
     station_owner_required,
 )
-from ev_backend.pagination import paginate, hard_cap, clamp_page_size, clamp_offset
+from ev_backend.pagination import apply_ordering, clamp_page_size, clamp_offset, paginate, window
 
 # Row keys shared between the cached station list and StationListType.
 _ROW_KEYS = (
@@ -86,12 +86,28 @@ class StationType(DjangoObjectType):
         # own station), the owner's contact details are not.
         return _public_user(self.owner)
 
+    # Hidden reviews never count (B2.1): a moderated review that still moves the
+    # station's rating has not been moderated, only made harder to read. Both
+    # paths below honour that — the annotation through `review_stats()`, the
+    # fallback through the same filter.
+    #
+    # Prefer the annotation when the queryset supplied one (B3). `stationsPageAdmin`
+    # annotates `review_stats()`, and these resolvers used to ignore it and
+    # re-query per row: the aggregate was computed in SQL, discarded, then paid
+    # for twice more per station — 22 queries for 10 rows, measured. The fallback
+    # stays for single-row reads (`stationById`, mutation payloads) that have no
+    # annotation to read.
+
     def resolve_num_of_reviews(self, info):
-        # Hidden reviews do not count (B2.1): a moderated review that still moves
-        # the station's rating has not been moderated, only made harder to read.
+        annotated = getattr(self, 'num_of_rate', None)
+        if annotated is not None:
+            return annotated
         return self.reviews.filter(is_hidden=False).count()
 
     def resolve_average_rating(self, info):
+        annotated = getattr(self, 'average_rate', None)
+        if annotated is not None:
+            return annotated
         return self.reviews.filter(is_hidden=False).aggregate(
             avg_rating=Avg("rating"),
         )["avg_rating"] or 0.0
@@ -543,11 +559,7 @@ class StationAdminQuery(graphene.ObjectType):
                     | Q(owner__username__icontains=term)
                 )
 
-        ordering = STATION_ADMIN_ORDER_FIELDS.get(order_by or 'newest', '-created_at')
-        # Tie-broken on the primary key: `created_at` collides for rows seeded in
-        # the same instant, and an unstable sort drops or repeats rows across
-        # pages (rule 5).
-        qs = qs.order_by(ordering, 'id')
+        qs = apply_ordering(qs, order_by, STATION_ADMIN_ORDER_FIELDS, '-created_at')
 
         items, total, has_next = paginate(qs, limit, offset)
         return AdminStationPage(items=items, total_count=total, has_next=has_next)
@@ -580,8 +592,7 @@ class StationAdminQuery(graphene.ObjectType):
                     | Q(station__name__icontains=term)
                 )
 
-        ordering = REVIEW_ORDER_FIELDS.get(order_by or 'newest', '-created_at')
-        qs = qs.order_by(ordering, 'id')
+        qs = apply_ordering(qs, order_by, REVIEW_ORDER_FIELDS, '-created_at')
 
         items, total, has_next = paginate(qs, limit, offset)
         return AdminReviewPage(
@@ -729,14 +740,6 @@ def _apply_station_filters(qs, charger_type, num_of_charger, min_rating, min_pow
     return qs
 
 
-def _window(qs, limit, offset):
-    """Apply an explicit page window when requested, else the legacy hard cap."""
-    if limit is not None:
-        start = clamp_offset(offset)
-        return qs[start:start + clamp_page_size(limit)]
-    return hard_cap(qs)
-
-
 def _station_filter_args():
     # Fresh argument instances per field (graphene must not share mounted args).
     return dict(
@@ -793,7 +796,7 @@ class StationQuery(graphene.ObjectType):
             _annotated_stations(info.context.user),
             charger_type, num_of_charger, min_rating, min_power, max_power,
         )
-        return [_station_to_list_type(s) for s in _window(qs, limit, offset)]
+        return [_station_to_list_type(s) for s in window(qs, limit, offset)]
 
     @login_required
     def resolve_my_stations(self, info, limit=None, offset=None):
@@ -802,7 +805,7 @@ class StationQuery(graphene.ObjectType):
             is_favorite=Exists(Favorite.objects.filter(user=user, station=OuterRef("pk"))),
             **review_stats(),
         )
-        return [_station_to_list_type(s) for s in _window(qs, limit, offset)]
+        return [_station_to_list_type(s) for s in window(qs, limit, offset)]
 
     @public
     def resolve_stations_page(self, info, charger_type=None, num_of_charger=None,

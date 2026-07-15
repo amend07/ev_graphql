@@ -109,10 +109,27 @@ instant, and an unstable sort silently repeats or drops rows across pages.
 **Why.** `usersByRole` returned the entire table — the one collection that escaped
 the pagination layer. It is now capped and deprecated in favour of `usersPage`.
 
-**Review-only.** B2.1 did **not** automate this, so every collection it added
-(`stationsPageAdmin`, `bookingsPage`, `reviewsPage`) is paginated and tie-broken
-only because a human checked. Still worth automating (assert every list field
-takes `limit`/`offset`) — B3.
+Use `window()` and `apply_ordering()` from `ev_backend/pagination.py` rather than
+re-typing either. Both were duplicated — the window three times, the ordering
+five — and each copy is a chance to drop the tie-break or the cap, silently.
+
+**Enforced (B3).** `accounts/test_b3_pagination.py`, three independent layers:
+
+- `EveryCollectionIsClassified` — every list/page field the schema publishes must
+  appear in `COLLECTIONS` declaring how it is bounded (PAGE / WINDOW / CAPPED,
+  and CAPPED costs a written justification). A new collection cannot merge
+  unclassified.
+- `EveryCollectionIsBounded` — shrinks the caps to 5, seeds 8 rows, asserts every
+  collection returns at most 5. It tests the **property, not the spelling**: any
+  bounding mechanism passes, and only an actually-unbounded field fails. A test
+  that grepped for a `paginate()` call would just be a spelling test. Verified by
+  reintroducing the exact `usersByRole` defect and watching it fail.
+- `EveryPagedCollectionHonoursLimit` — bounded is not pageable. A field that caps
+  at 500 but ignores `limit` makes the client's paging decorative.
+
+This rule spent two sprints as "worth automating next sprint" while B2.1 added
+three more collections under it. It cost ~200 lines. **The gap between a rule and
+its test is where the next `usersByRole` lives.**
 
 ## 6. New admin functionality requires regression tests
 
@@ -211,6 +228,72 @@ client.
    consider whether it needs a safety interlock (rules 4 and 12 below).
 6. Tests for anonymous / customer / owner / admin (rule 6).
 7. Export the schema and run the web client's codegen + tsc + tests (rule 9).
+
+## 13. A guard you have not seen fail is not a guard
+
+After writing a test that enforces a rule, **break the rule on purpose and watch
+the test fail**, then revert. Put the failure in the commit message.
+
+**Why.** This is the most valuable habit of B1–B3 and it is worth more than any
+single rule above. A guard that cannot fail is worse than no guard: it reports
+safety it never checked, and it is indistinguishable from a working one until the
+day it matters. Every guard in this codebase has been verified this way —
+`SchemaHygiene` by republishing `Station.bookings`, `EveryCollectionIsBounded` by
+restoring the unbounded `usersByRole`, the N+1 tests by reverting the annotation
+fix. Two of those were written by an author who believed the rule was already
+enforced.
+
+The corollary bites hardest on thresholds: a fixed `assertNumQueries(4)` passes an
+N+1 that happens to equal 4 at the size you tested. B3's query-count tests compare
+**two** page sizes for that reason — they assert the shape of the cost, not a
+number that has to be maintained.
+
+**Review-only, permanently.** No test can check that you tested your test.
+
+## 14. Resolvers read annotations; they never re-query per row
+
+If a queryset annotates a value, the resolver reads the annotation. Per-row
+queries in a list resolver are N+1 by construction.
+
+**Why.** `stationsPageAdmin` annotated `review_stats()` and then its resolvers
+ignored it and re-queried each station's rating anyway: the aggregate was computed
+in SQL, discarded, and paid for twice more per row — **22 queries for 10 stations**,
+measured. Invisible in review, invisible in a ten-row dev database, and invisible
+in tests that only assert content.
+
+**Enforced (B3).** `accounts/test_b3_query_counts.py` runs every page at two sizes
+and fails if the query count grows with the row count.
+
+## 15. Administrator privilege is not grantable over the API
+
+`role` is writable from the server only — `manage.py promote_admin`, through
+`administration.promote_to_admin`, audited. There is no `promoteToAdmin` mutation
+and this is a decision, not an omission.
+
+**Why.** A stolen admin session today buys damage. If promotion were an API call
+it would also buy **persistence**: the attacker mints a second admin and revoking
+the one you noticed achieves nothing. Requiring server access to grant privilege
+means recovery is always possible. The zero-admin bootstrap could not be a
+mutation anyway — you would need an admin to call it. It is a rare, high-blast-
+radius operation, and needing a shell is the safeguard, not the inconvenience.
+
+**Enforced (B3).** `test_b3_admin_bootstrap.py::PrivilegeIsNotGrantableOverTheApi`
+asserts no role-writing mutation exists, and that registration cannot mint an admin.
+
+## 16. Undecided behaviour gets a characterization test, not a guess
+
+When the code does something only because nobody has decided otherwise, pin it
+with a test that says so in its docstring — what the options are, what each costs,
+and the one function where the decision goes.
+
+**Why.** "A rejected owner's stations stay online" is not a design; it is the
+absence of one. Left unpinned it becomes a design by accident — someone changes it
+in an unrelated refactor and nobody notices, or everyone assumes it was decided.
+The test cannot tell a deliberate change from a mistake, which is exactly why it
+must fail loudly and force a human to say which it was.
+
+**Enforced (B3).** `accounts/test_b3_product_decisions.py`. See rule 7's cousin:
+the decision belongs to the business, and inventing one in code is the failure.
 
 ## 12. Interlocks on anything unrecoverable
 
@@ -348,18 +431,20 @@ outlives its subject", and it is the right trade.
 
 ## Known deviations (tracked, not forgotten)
 
-Honest list of places the codebase does not yet meet these rules:
+Honest list of where the codebase does not meet its own rules. Anything marked
+**product decision** must not be resolved in code — see rule 16.
 
 | Rule | Deviation | Plan |
 |---|---|---|
-| 5 | `usersByRole` truncates at 500 without telling the caller | Deprecated; migrate W3 to `usersPage`, then delete (B3) |
-| 3 | A rejected owner's existing stations stay live and bookable | **Still needs a product decision** — do not invent one. B2.1 gives an admin a manual lever (`deactivateStation`); that is a workaround, not the decision (B3) |
-| 5 | Enforcement of "collections are paginated" is review-only | **Not done in B2.1** — still review-only, and every collection added this sprint is paginated only because a human checked. Automate (B3) |
-| 12 | Admin creation/promotion is shell-only | Add a bootstrap path (B3) |
-| 10 | Email is sent synchronously in-request with `fail_silently=False` | Wire a real queue, or keep sync deliberately (B3) |
-| 5 | `stationsPageAdmin`/`reviewsPage` resolve `averageRating`/`numOfReviews` per row (N+1) | Bounded by the page cap (≤100) and admin-only, so it is slow, not dangerous. Read the annotation `review_stats()` already adds (B3) |
-| — | `dashboardSummary` runs the `newestUsers`/`newestStations` queries even when the caller selects neither | Two queries nobody asked for; move them into field resolvers (B3) |
-| — | No `restoreStation`. `Station` has one `is_active` flag, so "restore" and "activate" would be **two names for one operation**, and an owner's soft delete is indistinguishable in the database from an admin takedown | **Needs a product decision.** If an admin takedown must survive an owner undoing it, that is a *second field* (e.g. `suspended_by_admin`), not a second mutation. Do not add the alias to make the API look complete (B3) |
+| 3 | A rejected owner's stations stay live and bookable | **Product decision.** Pinned by `test_b3_product_decisions.py`, which documents both options, their costs, and the one function the decision goes in (`administration.reject_owner`). The lever Option A needs already exists and is audited. Do not resolve this in code (B4) |
+| — | No `restoreStation`: `Station` has one `is_active` flag, so "restore" and "activate" would be two names for one operation, and an owner's soft delete is indistinguishable from an admin takedown | **Product decision.** If a takedown must survive an owner undoing it, that is a *second field* (`suspended_by_admin`), not a second mutation. Do not add the alias to make the API look complete (B4) |
+| 5 | `usersByRole` truncates at 500 silently | **Now callerless**: W4 migrated the web console to `usersPage`, and no mobile client ever used it. Delete once W4 ships — it is the last silent truncation in the schema (B4) |
+| 10 | Email is sent synchronously in-request with `fail_silently=False` | A slow SMTP server blocks an OTP mutation. Wire a real queue, or keep it synchronous *deliberately* and write down why (B4) |
+| — | `dashboardSummary` runs the `newestUsers`/`newestStations` queries even when the caller selects neither | Two queries nobody asked for. Constant cost, not N+1 — measured at 6 queries regardless of platform size. Move them to field resolvers (B4) |
+| 4 | That a *new* admin mutation routes through the service layer is review-only | Audit is unskippable for existing paths by construction, but nothing stops a new resolver writing to the DB directly. Plausibly automatable: assert no resolver imports a model's `.save()`/`.delete()` outside a service (B4) |
+| 9 | Client compatibility is proven by exporting the schema, but a human must remember to run it | The check is real and has caught three production-breaking defects; the trigger is a habit. Could be CI: export, diff, fail on a breaking change without an explicit override (B4) |
+| 12 | Object-level ownership (`station.owner_id != user.id`) is checked per resolver | The policy test proves a decorator exists, not that it checked the *right* station. Four call sites, two different error messages. Consolidating would change client-visible strings, so it stays deliberate and manual (B4) |
+| 13 | Nothing can verify that a guard was verified | Permanent. Rule 13 is a habit, not a mechanism |
 
 ### Fixed since B1
 
@@ -368,3 +453,9 @@ Honest list of places the codebase does not yet meet these rules:
 | — | No station reactivation path: a soft-deleted station needed database access to recover | `activateStation` (admin, audited) |
 | 4 | Owner approval recorded the event but not the decision — nothing said who decided, when, or why | `reviewer` / `reviewedAt` / `rejectionReason` on the record; `reason` mandatory on reject |
 | 4 | The audit trail covered users only | Extends to stations and reviews; filterable by actor, target type and date |
+| 5 | "Collections are paginated" was enforced by review, and review had already lost once | Automated: schema-vs-contract, a behavioural bounds test that shrinks the caps and over-seeds, and a limit-honoured test (B3) |
+| 5 | The window idiom existed 3× and the ordering idiom 5×, each copy free to forget the cap or the `id` tie-break | `window()` and `apply_ordering()` in `ev_backend/pagination.py` (B3) |
+| 14 | `stationsPageAdmin` re-queried each row's rating despite the queryset annotating it — 22 queries for 10 stations | Resolvers read the annotation: **2 queries**, pinned by a two-size query-count test (B3) |
+| 12 | Admin privilege came from an interactive script at the repo root that wrote no audit record | `manage.py promote_admin` through the service layer, audited, idempotent, `--dry-run` (B3) |
+| 12 | The last-admin interlock told operators to "promote another administrator first" — an action no API offered | The message now names the command that does it (B3) |
+| 16 | "A rejected owner's stations stay online" was undecided *and* unpinned | Pinned by characterization tests that name the options, the costs, and the decision point (B3) |

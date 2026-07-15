@@ -41,15 +41,57 @@ def _assert_not_self(actor, target, action):
 def _assert_not_last_admin(target, action):
     """Refuse to remove the platform's last way in.
 
-    Only ever triggers for an active admin: there is no API to create one (see
-    `create_admin_user.py`), so locking out the last one is unrecoverable without
-    shell access to the server.
+    Only ever triggers for an active admin. Admin privilege is not grantable over
+    the API by design, so losing the last one costs server access to recover.
     """
     if target.role == 'admin' and target.is_active and _active_admin_count(excluding=target) == 0:
         raise Conflict(
             f"You cannot {action} the last active administrator. "
-            "Promote another administrator first."
+            "Promote another administrator first "
+            "(on the server: manage.py promote_admin <username>)."
         )
+
+
+def promote_to_admin(*, target, actor=None, via='', request=None):
+    """Grant administrator privilege. Idempotent.
+
+    Deliberately has NO GraphQL mutation in front of it, and that is the security
+    decision of this sprint rather than an omission:
+
+    * Today, stealing an admin session buys damage. If promotion were an API call
+      it would also buy PERSISTENCE — the attacker mints a second admin, and
+      revoking the one you noticed changes nothing. Keeping the grant off the
+      network means recovery is always possible by an operator with server access.
+    * The zero-admin bootstrap cannot be solved by a mutation anyway: you would
+      need an admin to call it.
+    * It is a rare, high-consequence operation. Needing a shell is a cost paid
+      about once a year, and it is the whole safeguard.
+
+    ``actor`` is None for a shell run — no one is signed in. ``via`` records what
+    performed it, so the trail distinguishes an operator on the box from a UI
+    action if a mutation is ever added.
+    """
+    if target.role == 'admin':
+        # Idempotent: no state change, so no misleading audit record.
+        return target
+
+    previous = target.role
+    target.role = 'admin'
+    # Django's own admin site and its permission checks key off is_staff, not our
+    # `role`. Granting one without the other produces an "admin" who fails half
+    # the checks in the codebase.
+    target.is_staff = True
+    target.save(update_fields=['role', 'is_staff'])
+
+    audit.record_user_action(
+        actor=actor,
+        action=AuditLog.ACTION_ADMIN_PROMOTED,
+        target_user=target,
+        request=request,
+        previous_role=previous,
+        via=via or 'unspecified',
+    )
+    return target
 
 
 def deletion_summary(user):

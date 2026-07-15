@@ -16,7 +16,7 @@ from accounts.permission import (
     station_owner_required,
 )
 from ev_backend.errors import NotFound
-from ev_backend.pagination import paginate, hard_cap, clamp_page_size, clamp_offset
+from ev_backend.pagination import apply_ordering, paginate, window
 
 
 class BookingCustomerType(graphene.ObjectType):
@@ -223,10 +223,7 @@ class BookingQuery(graphene.ObjectType):
     @login_required
     def resolve_my_bookings(self, info, status=None, limit=None, offset=None):
         qs = _my_bookings_qs(info.context.user, status)
-        if limit is not None:
-            start = clamp_offset(offset)
-            return qs[start:start + clamp_page_size(limit)]
-        return hard_cap(qs)
+        return window(qs, limit, offset)
 
     @login_required
     def resolve_my_bookings_page(self, info, status=None, limit=None, offset=None):
@@ -251,10 +248,7 @@ class BookingQuery(graphene.ObjectType):
         )
         if status:
             qs = qs.filter(status=status)
-        if limit is not None:
-            start = clamp_offset(offset)
-            return qs[start:start + clamp_page_size(limit)]
-        return hard_cap(qs)
+        return window(qs, limit, offset)
 
 
 class BookingMutation(graphene.ObjectType):
@@ -335,8 +329,7 @@ class BookingAdminQuery(graphene.ObjectType):
                     | Q(station__name__icontains=term)
                 )
 
-        ordering = BOOKING_ORDER_FIELDS.get(order_by or 'newest', '-created_at')
-        qs = qs.order_by(ordering, 'id')  # tie-broken (rule 5)
+        qs = apply_ordering(qs, order_by, BOOKING_ORDER_FIELDS, '-created_at')
 
         items, total, has_next = paginate(qs, limit, offset)
         return BookingPage(items=items, total_count=total, has_next=has_next)

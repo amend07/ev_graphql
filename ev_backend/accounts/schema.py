@@ -10,7 +10,7 @@ from .permission import admin_required, login_required
 from .models import AuditLog, PasswordResetOTP
 from . import administration, services, ratelimit
 from .auth_logging import log_event
-from ev_backend.pagination import hard_cap, paginate
+from ev_backend.pagination import apply_ordering, hard_cap, paginate
 # `stations.schema` imports `accounts.permission`, never `accounts.schema`, so
 # this direction does not cycle. PublicUserType is the identity-only audience
 # type shared by every "someone else's user" field in the API.
@@ -501,11 +501,7 @@ class AdminQuery(graphene.ObjectType):
                     Q(username__icontains=term) | Q(email__icontains=term)
                 )
 
-        ordering = USER_ORDER_FIELDS.get(order_by or 'newest', '-date_joined')
-        # Tie-break on the primary key: `date_joined` collides for accounts made
-        # in the same instant, and an unstable sort silently drops or repeats
-        # rows across pages.
-        qs = qs.order_by(ordering, 'id')
+        qs = apply_ordering(qs, order_by, USER_ORDER_FIELDS, '-date_joined')
 
         items, total, has_next = paginate(qs, limit, offset)
         return UserPage(items=items, total_count=total, has_next=has_next)
@@ -537,8 +533,8 @@ class AdminQuery(graphene.ObjectType):
         if date_to is not None:
             qs = qs.filter(created_at__lte=date_to)
 
-        ordering = AUDIT_ORDER_FIELDS.get(order_by or 'newest', '-created_at')
-        qs = qs.order_by(ordering, '-id')  # tie-broken (rule 5)
+        # Ties on -id, not id: within one timestamp the newest entry stays first.
+        qs = apply_ordering(qs, order_by, AUDIT_ORDER_FIELDS, '-created_at', tie_break='-id')
 
         items, total, has_next = paginate(qs, limit, offset)
         return AuditLogPage(items=items, total_count=total, has_next=has_next)
