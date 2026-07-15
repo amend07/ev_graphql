@@ -6,12 +6,14 @@ anonymous callers before B1 — they are the reason this sprint exists.
 """
 
 from datetime import timedelta
+from pathlib import Path
 
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import AnonymousUser
 from django.test import RequestFactory, TestCase
 from django.utils import timezone
 from graphene.test import Client
+from graphene_django import DjangoObjectType
 
 from bookings.models import Booking
 from ev_backend.schema import schema
@@ -171,6 +173,60 @@ class UserTypeExposure(TestCase):
         fields = type_fields("StationType")
         for leaked in ("bookings", "reviews", "favoritedBy"):
             self.assertNotIn(leaked, fields)
+
+
+class SchemaHygiene(TestCase):
+    """Rules 1 and 3 of BACKEND_ENGINEERING_PRINCIPLES.md, enforced.
+
+    The B1 audit's lesson was that a rule nobody checks is a rule that gets
+    broken — "don't expose private data" was always the intent, and the data was
+    exposed anyway. These two tests apply to EVERY type, including ones nobody
+    has written yet, so the next `__all__` fails the build instead of shipping.
+    """
+
+    SCHEMA_MODULES = (
+        Path(__file__).resolve().parent.parent / "accounts" / "schema.py",
+        Path(__file__).resolve().parent.parent / "stations" / "schema.py",
+        Path(__file__).resolve().parent.parent / "bookings" / "schema.py",
+    )
+
+    def test_no_graphql_type_uses_an_open_field_policy(self):
+        # `__all__`/`exclude` publish every future model field and reverse
+        # relation by default. An allow-list fails closed; these fail open.
+        for module in self.SCHEMA_MODULES:
+            source = module.read_text()
+            for banned in ('fields = "__all__"', "fields = '__all__'", "exclude = "):
+                self.assertNotIn(
+                    banned, source,
+                    f"{module.name} uses `{banned.strip()}` — list fields explicitly "
+                    f"(see BACKEND_ENGINEERING_PRINCIPLES.md rule 1).",
+                )
+
+    def test_no_django_type_publishes_a_reverse_relation(self):
+        """Semantic backstop for the same rule.
+
+        Every type in the built schema is checked against its model's reverse
+        accessors, so this catches an open field policy even if it is introduced
+        some way the source scan above does not recognise.
+        """
+        for gql_type in schema.graphql_schema.type_map.values():
+            graphene_type = getattr(gql_type, "graphene_type", None)
+            if not (isinstance(graphene_type, type)
+                    and issubclass(graphene_type, DjangoObjectType)):
+                continue
+
+            model = graphene_type._meta.model
+            reverse_accessors = {
+                rel.get_accessor_name() for rel in model._meta.related_objects
+            }
+            published = set(graphene_type._meta.fields)
+            leaked = published & reverse_accessors
+            self.assertEqual(
+                leaked, set(),
+                f"{graphene_type.__name__} publishes reverse relation(s) {leaked}. "
+                f"Reverse relations are traversal edges: expose a purpose-built "
+                f"field instead (rule 3).",
+            )
 
 
 class BookingAuthorization(TestCase):
