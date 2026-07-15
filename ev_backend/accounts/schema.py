@@ -434,7 +434,17 @@ class AdminQuery(graphene.ObjectType):
         order_by=graphene.String(),
         limit=graphene.Int(),
         offset=graphene.Int(),
-        description="Paginated, searchable, filterable user directory.",
+        # Says what `search` and `orderBy` actually do. Without this a client can
+        # only guess, and an honest client is then forced to write vague UI copy
+        # rather than name the fields it searches — which is exactly what
+        # happened in W4. The B2.1 endpoints document theirs; this one is B1's
+        # and did not.
+        description=(
+            "Paginated, searchable, filterable user directory. Admin only. "
+            "search matches username or email (case-insensitive, partial). "
+            "orderBy is an allow-list (newest | oldest | username | last_login); "
+            "an unrecognised value falls back to newest rather than erroring."
+        ),
     )
     all_otps = graphene.List(OTPType)
     audit_logs_page = graphene.Field(
