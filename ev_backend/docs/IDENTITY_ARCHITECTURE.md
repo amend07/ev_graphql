@@ -231,21 +231,45 @@ Until these exist, the honest deliverable is: the identity model, the linking
 rules, the migration, and the flows that need no third party — **and a clear
 "phone sign-in is not yet available" rather than a button that fails**.
 
-## 9. Product decisions required — cannot be resolved in code
+## 9. Product decisions — DECIDED (W7)
 
-1. **What happens to existing accounts with no phone?** The brief says "do not
-   allow a production account without a verified phone" *and* "existing accounts
-   must continue working". Both cannot hold: every current account has no phone.
-   Someone must choose: (a) new accounts only, legacy grandfathered indefinitely;
-   (b) legacy prompted but skippable; (c) hard cut-off at a date, after which
-   legacy users cannot sign in until they add a phone. **This is a business
-   decision about locking people out of their bookings.** Phase 4 exists for it.
-2. **Which SMS provider, and what is the per-message budget?** Determines the
-   delivery adapter and the abuse ceiling.
-3. **Is per-device session revocation required, or is "log out everywhere"
-   enough?** Decides §5(a) vs §5(b) — a schema change and client work versus one
-   column. The profile "Active sessions" list requires (a).
-4. **One phone per account, or one phone across all accounts?** The design says
+Recorded here because the reasoning matters more than the answer, and the next
+person to read this file will otherwise re-litigate it.
+
+1. **Legacy accounts with no phone → PROMPT, BUT SKIPPABLE.** New accounts require
+   a verified phone; existing users are asked at sign-in and may decline. Nobody
+   is locked out of their bookings. **The cost, stated plainly: two identity
+   classes coexist indefinitely, and "every account has a phone" is never true.
+   Nothing may be built on that assumption** — any code that treats phone as
+   guaranteed is a bug waiting for a legacy user. Phase 4 stays unscheduled until
+   real adoption numbers justify it, and it needs the support escape hatch in
+   §9.1a first.
+   - 9.1a **Prerequisite for any future enforcement**: there is no admin
+     "set/reset a user's phone" path. Without one, an enforced cut-off would lock
+     users out with no way for support to rescue them. Build that before phase 4
+     is ever considered.
+2. **SMS delivery → PLUGGABLE ADAPTER, console in dev.** Mirrors Django's
+   `EMAIL_BACKEND`. The flow is wired end-to-end; when no provider is configured
+   it refuses honestly rather than pretending to send. A real adapter (Twilio /
+   Africa's Talking — the latter is generally better for Ethiopian numbers) is one
+   class, added when an account exists.
+3. **Session revocation → `token_version` column.** One integer on `User`,
+   asserted in the JWT payload; `logoutEverywhere` increments it and every live
+   token dies on its next request. Delivers the property the platform actually
+   lacks — a compromised credential can be cut off — for one column and zero
+   client changes.
+   - **Consequence, accepted: the profile "Active sessions" list is NOT built.**
+     Stateless tokens cannot be enumerated. A list showing one row saying "this
+     device" would be fabricated UI, so the screen is deferred to W8 with
+     `refresh_token` rather than faked.
+
+## 9b. Decisions still open
+
+1. **Which SMS provider, and what is the per-message budget?** The adapter is
+   provider-agnostic, so this blocks only the real send — not the design. The
+   budget sets the abuse ceiling in §7 (SMS pumping), which becomes urgent the
+   day a real provider is wired.
+2. **One phone per account, or one phone across all accounts?** The design says
    globally unique (a phone identifies a human). This means a shared family phone
    cannot hold two accounts. That is a real product constraint, deliberately
    chosen, and worth confirming.

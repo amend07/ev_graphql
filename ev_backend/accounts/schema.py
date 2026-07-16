@@ -6,10 +6,15 @@ from graphene_django import DjangoObjectType
 from django.contrib.auth import get_user_model
 from django.db.models import Q
 
-from .permission import admin_required, login_required
-from .models import AuditLog, PasswordResetOTP
-from . import administration, services, ratelimit
+from graphql_jwt.shortcuts import get_token
+
+from .permission import admin_required, login_required, public
+from .models import AuditLog, AuthIdentity, PasswordResetOTP
+from . import administration, identity, phone_service, services, ratelimit
 from .auth_logging import log_event
+from .phone import mask_phone
+from .sms import sms_configured
+from ev_backend.errors import ValidationError
 from ev_backend.pagination import apply_ordering, hard_cap, paginate
 # `stations.schema` imports `accounts.permission`, never `accounts.schema`, so
 # this direction does not cycle. PublicUserType is the identity-only audience
@@ -17,6 +22,51 @@ from ev_backend.pagination import apply_ordering, hard_cap, paginate
 from stations.schema import PublicUserType, StationType
 
 User = get_user_model()
+
+
+def _identity_label(identity_row):
+    """Display text for a linked identity. NEVER returns the raw subject.
+
+    Phone is masked. For Google and Apple the subject is an opaque provider ID
+    that means nothing to a human and identifies them across every app using that
+    provider, so the label is the provider's name and the subject is simply not
+    disclosed — there is nothing useful in it to show. The password identity's
+    subject is the username, which the user already sees on their own profile,
+    but it is labelled generically rather than echoed so that no code path treats
+    "the label" as "the subject".
+    """
+    if identity_row.provider == AuthIdentity.PROVIDER_PHONE:
+        return mask_phone(identity_row.subject)
+    return {
+        AuthIdentity.PROVIDER_GOOGLE: 'Google',
+        AuthIdentity.PROVIDER_APPLE: 'Apple',
+        AuthIdentity.PROVIDER_PASSWORD: 'Username and PIN',
+    }.get(identity_row.provider, identity_row.provider)
+
+
+class LinkedIdentityType(graphene.ObjectType):
+    """One sign-in method on your own account (W7).
+
+    NOTE WHAT IS ABSENT: `subject`. It is the provider's stable identifier for a
+    person — Google's `sub`, or the raw E.164 number — and it is not published
+    here, not even to the account's own owner. No screen needs it, and a field
+    that exists is a field that ends up hanging off a public type one refactor
+    later. `test_identity_subject_is_never_public` fails if it ever appears.
+
+    `label` is the human-readable stand-in, masked for phone.
+    """
+
+    provider = graphene.String(required=True, description="'phone', 'google', 'apple' or 'password'.")
+    label = graphene.String(
+        required=True,
+        description="Display text for this method, e.g. a masked phone number. Never the raw subject.",
+    )
+    verified = graphene.Boolean(
+        required=True,
+        description="Whether this method was ever proven. False for pre-W7 password logins.",
+    )
+    linked_at = graphene.DateTime(required=True)
+    last_used_at = graphene.DateTime()
 
 
 class UserType(DjangoObjectType):
@@ -45,11 +95,24 @@ class UserType(DjangoObjectType):
     # `UserType` — the exact widening rule 3 exists to prevent.
     reviewer = graphene.Field(PublicUserType)
 
+    # Every way this account can sign in (W7). Resolved rather than a model
+    # relation so that `subject` cannot travel with it — see LinkedIdentityType.
+    linked_providers = graphene.List(
+        graphene.NonNull(LinkedIdentityType),
+        required=True,
+        description="Sign-in methods linked to this account. Empty list, never null.",
+    )
+
     class Meta:
         model = User
         fields = (
             # Identity — both clients select these.
             "id", "username", "email",
+            # Canonical identity (W7). NULLABLE, and clients must handle that:
+            # every pre-W7 account has no phone, and per the §9.1 decision legacy
+            # users are prompted but not forced. A client that assumes a phone is
+            # present is a client that breaks for its oldest users.
+            "phone_e164", "phone_verified_at",
             # Authorization/state — clients route on role, W3 lists status.
             "role", "is_active", "owner_status",
             # Owner-decision provenance (B2.1). `rejectionReason` is what a
@@ -72,6 +135,24 @@ class UserType(DjangoObjectType):
             PublicUserType(id=self.reviewer.id, username=self.reviewer.username)
             if self.reviewer_id else None
         )
+
+    def resolve_linked_providers(self, info):
+        """Map identities to their public shape. `subject` stops here.
+
+        This resolver is the only place a subject is ever read for output, and it
+        is read to derive a label and then dropped. Everything above it in the
+        schema deals in labels.
+        """
+        return [
+            LinkedIdentityType(
+                provider=i.provider,
+                label=_identity_label(i),
+                verified=i.verified_at is not None,
+                linked_at=i.linked_at,
+                last_used_at=i.last_used_at,
+            )
+            for i in self.identities.all()
+        ]
 
 
 class OTPType(DjangoObjectType):
@@ -481,12 +562,19 @@ class AdminQuery(graphene.ObjectType):
         # Bounded (B1 Phase 6): this was the one collection that could return the
         # whole table. The cap is a truncation the caller cannot see, which is
         # why it is deprecated in favour of usersPage rather than left as-is.
-        return hard_cap(User.objects.filter(role=role).order_by('id'))
+        return hard_cap(
+            User.objects.filter(role=role).prefetch_related('identities').order_by('id')
+        )
 
     @admin_required
     def resolve_users_page(self, info, role=None, search=None, is_active=None,
                            owner_status=None, order_by=None, limit=None, offset=None):
-        qs = User.objects.all()
+        # `identities` is prefetched unconditionally (W7). It costs one extra
+        # query when nobody selects `linkedProviders`, and saves one per row when
+        # someone does — and a client selecting it cannot be prevented, because
+        # the field is on UserType and UserType is what this returns. Measured:
+        # without this, 12 rows cost 14 queries and 2 rows cost 4.
+        qs = User.objects.prefetch_related('identities')
 
         if role:
             qs = qs.filter(role=role)
@@ -625,17 +713,201 @@ class AdminMutation(graphene.ObjectType):
     reject_station_owner = RejectStationOwner.Field()
 
 
+# ── Identity (Sprint W7) ─────────────────────────────────────────────────────
+#
+# See docs/IDENTITY_ARCHITECTURE.md. Every rule these mutations enforce lives in
+# accounts/identity.py; the handlers here stay thin, exactly as the PIN mutations
+# delegate to services.py.
+
+
+class AuthCapabilitiesType(graphene.ObjectType):
+    """What sign-in methods this deployment can ACTUALLY perform right now.
+
+    Exists so a client can disable a button and say why, instead of offering a
+    flow that is guaranteed to fail. Read from real configuration, not from
+    intent: `phoneSignIn` is false whenever no SMS provider is wired, which is
+    the default today.
+    """
+
+    phone_sign_in = graphene.Boolean(
+        required=True, description="Whether a phone code can actually be delivered."
+    )
+    google_sign_in = graphene.Boolean(required=True, description="Whether Google sign-in is available.")
+    apple_sign_in = graphene.Boolean(required=True, description="Whether Apple sign-in is available.")
+    password_sign_in = graphene.Boolean(
+        required=True, description="Whether username/PIN sign-in is available."
+    )
+
+
+class SendPhoneOtp(graphene.Mutation):
+    """Send a verification code to a phone number.
+
+    Public: signing in, signing up and linking all begin here, and two of those
+    have no session yet.
+
+    The reply is identical whether or not the number is known — see the
+    enumeration rule in phone_service.py.
+    """
+
+    success = graphene.Boolean()
+    message = graphene.String()
+    destination = graphene.String(
+        description="The masked number the code went to, for confirming a typo."
+    )
+
+    class Arguments:
+        phone = graphene.String(
+            required=True, description="Any common format; normalised to E.164 server-side."
+        )
+
+    @public
+    def mutate(self, info, phone):
+        try:
+            e164, message = phone_service.send_phone_otp(phone, request=info.context)
+        except ratelimit.RateLimitExceeded:
+            raise ValidationError(services.GENERIC_RATE_LIMITED)
+        return SendPhoneOtp(
+            success=True, message=message, destination=phone_service.describe_destination(e164)
+        )
+
+
+class SignInWithPhone(graphene.Mutation):
+    """Exchange a verified phone code for a session, creating the account if new.
+
+    The mutation W7 exists for: the phone IS the identity, so proving the handset
+    is signing in. There is no separate register step — a number we have never
+    seen becomes an account, one we have seen returns to its owner. `created`
+    tells the client which happened so it can route to onboarding.
+    """
+
+    token = graphene.String(description="JWT, as `tokenAuth` returns.")
+    user = graphene.Field(UserType)
+    created = graphene.Boolean(description="True if this call registered a new account.")
+
+    class Arguments:
+        phone = graphene.String(required=True)
+        code = graphene.String(required=True)
+
+    @public
+    def mutate(self, info, phone, code):
+        try:
+            e164 = phone_service.verify_phone_otp(phone, code, request=info.context)
+        except ratelimit.RateLimitExceeded:
+            raise ValidationError(services.GENERIC_RATE_LIMITED)
+
+        user, created = identity.sign_in_with_identity(
+            provider=AuthIdentity.PROVIDER_PHONE, subject=e164
+        )
+        log_event('login_success', request=info.context, user=user, method='phone')
+        # get_token runs JWT_PAYLOAD_HANDLER, so this token carries the user's
+        # token_version like every other one and is revocable.
+        return SignInWithPhone(token=get_token(user), user=user, created=created)
+
+
+class LinkPhone(graphene.Mutation):
+    """Attach a verified phone to the SIGNED-IN account.
+
+    Separate from signInWithPhone even though both spend a code, because they ask
+    different questions. This one asks "does the holder of this session also hold
+    this handset" — and requiring both halves at once is the only evidence that
+    justifies joining two identities. It is exactly the evidence a matching email
+    address does not provide, which is why linking is never inferred from one.
+    """
+
+    success = graphene.Boolean()
+    user = graphene.Field(UserType)
+
+    class Arguments:
+        phone = graphene.String(required=True)
+        code = graphene.String(required=True)
+
+    @login_required
+    def mutate(self, info, phone, code):
+        try:
+            e164 = phone_service.verify_phone_otp(phone, code, request=info.context)
+        except ratelimit.RateLimitExceeded:
+            raise ValidationError(services.GENERIC_RATE_LIMITED)
+
+        user = identity.attach_phone(user=info.context.user, phone_e164=e164)
+        log_event('phone_linked', request=info.context, user=user)
+        return LinkPhone(success=True, user=user)
+
+
+class UnlinkProvider(graphene.Mutation):
+    """Remove a sign-in method. Refuses to strand you — see identity.unlink_identity."""
+
+    success = graphene.Boolean()
+    user = graphene.Field(UserType)
+
+    class Arguments:
+        provider = graphene.String(required=True, description="'phone', 'google', 'apple' or 'password'.")
+
+    @login_required
+    def mutate(self, info, provider):
+        identity.unlink_identity(user=info.context.user, provider=provider)
+        log_event(
+            'identity_unlinked', request=info.context, user=info.context.user, provider=provider
+        )
+        return UnlinkProvider(success=True, user=info.context.user)
+
+
+class LogoutEverywhere(graphene.Mutation):
+    """Invalidate every token ever issued to you, including the one calling this.
+
+    The platform's answer to "my phone was stolen", which before W7 was "wait".
+
+    Deliberately not paired with an "Active sessions" screen: the tokens are
+    stateless and unenumerable, so such a list could only show invented rows.
+    Per-device revocation needs refresh tokens (W8, §5c).
+    """
+
+    success = graphene.Boolean()
+
+    @login_required
+    def mutate(self, info):
+        identity.revoke_all_sessions(user=info.context.user)
+        log_event('sessions_revoked', request=info.context, user=info.context.user)
+        return LogoutEverywhere(success=True)
+
+
 class AccountsQuery(graphene.ObjectType):
     me = graphene.Field(UserType)
+    auth_capabilities = graphene.Field(
+        AuthCapabilitiesType,
+        required=True,
+        description="Which sign-in methods this deployment can actually perform.",
+    )
 
     @login_required
     def resolve_me(self, info):
         return info.context.user
 
+    @public
+    def resolve_auth_capabilities(self, info):
+        return AuthCapabilitiesType(
+            # Real: reflects whether an SMS adapter is actually configured.
+            phone_sign_in=sms_configured(),
+            # Honest constants, not placeholders. There is no Google/Apple client
+            # ID, no token verification path, and nothing to toggle — so these
+            # report false rather than pretending to be configurable. W8 replaces
+            # them with a real check once credentials exist; until then a client
+            # that offers those buttons is offering nothing.
+            google_sign_in=False,
+            apple_sign_in=False,
+            password_sign_in=True,
+        )
+
 
 class AccountsMutation(graphene.ObjectType):
     create_user = CreateUser.Field()
     approve_station_owner = ApproveStationOwner.Field()
+
+    # Identity (W7).
+    send_phone_otp = SendPhoneOtp.Field()
+    sign_in_with_phone = SignInWithPhone.Field()
+    link_phone = LinkPhone.Field()
+    unlink_provider = UnlinkProvider.Field()
+    logout_everywhere = LogoutEverywhere.Field()
 
     # Canonical PIN mutations.
     send_pin_reset_otp = SendPinResetOtp.Field()

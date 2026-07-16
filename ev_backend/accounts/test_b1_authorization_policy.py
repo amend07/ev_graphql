@@ -56,6 +56,11 @@ QUERY_POLICY = {
     'bookingById': POLICY_ADMIN,
     'reviewsPage': POLICY_ADMIN,
     'dashboardSummary': POLICY_ADMIN,
+    # Public by necessity (W7): the sign-in screen asks this BEFORE anyone has a
+    # session, to decide which buttons it can honestly offer. It discloses which
+    # methods this deployment supports — configuration, not user data — which is
+    # already inferable by pressing the buttons.
+    'authCapabilities': POLICY_PUBLIC,
 }
 
 MUTATION_POLICY = {
@@ -69,9 +74,26 @@ MUTATION_POLICY = {
     'resetPinWithOtp': POLICY_PUBLIC,
     'sendPasswordResetOtp': POLICY_PUBLIC,
     'resetPasswordWithOtp': POLICY_PUBLIC,
+    # Identity (W7). Public for the same reason as tokenAuth — these ARE the
+    # sign-in path, and the person using them has no session yet by definition.
+    # The protection is not a policy decorator: it is possession of the handset,
+    # plus rate limiting per IP and per normalised number, plus replies that are
+    # identical whether or not the number is known.
+    'sendPhoneOtp': POLICY_PUBLIC,
+    'signInWithPhone': POLICY_PUBLIC,
     # Signed in.
     'changePin': POLICY_AUTHENTICATED,
     'changePassword': POLICY_AUTHENTICATED,
+    # Identity management, on your own account only (W7).
+    #
+    # POLICY_AUTHENTICATED, not POLICY_ACTIVE, and the distinction is deliberate:
+    # a deactivated user must still be able to secure their account. Revoking a
+    # stolen session is the one thing that must not require being in good
+    # standing — and `linkPhone` is what a legacy user does to comply with the
+    # §9.1 prompt, which they may be doing precisely because access is limited.
+    'linkPhone': POLICY_AUTHENTICATED,
+    'unlinkProvider': POLICY_AUTHENTICATED,
+    'logoutEverywhere': POLICY_AUTHENTICATED,
     # Active account required for anything that writes domain data.
     'createBooking': POLICY_ACTIVE,
     'cancelBooking': POLICY_ACTIVE,
@@ -163,6 +185,16 @@ class ResolversEnforceTheirDeclaredPolicy(TestCase):
         allowed_public = {
             'stationList', 'filterStations', 'stationsPage', 'stationById',
             'stationReviews',
+            # W7. The one non-discovery public query, admitted deliberately and
+            # on a narrower ground than the others: it returns four booleans
+            # about this deployment's own configuration and reaches no model at
+            # all. It cannot traverse to user data because it does not traverse.
+            #
+            # Adding to this set must stay expensive. The question to answer
+            # before the next entry is not "is it convenient" but "what can an
+            # anonymous caller reach THROUGH it" — B1's leak was not a field that
+            # held private data, it was a public field that could walk to it.
+            'authCapabilities',
         }
         actually_public = {f for f, p in QUERY_POLICY.items() if p == POLICY_PUBLIC}
         self.assertEqual(actually_public, allowed_public)

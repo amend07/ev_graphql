@@ -154,6 +154,21 @@ class UserTypeExposure(TestCase):
                 # this assertion failing is the mechanism working, so widening
                 # the list is a decision, never a way to fix a red build.
                 "reviewedAt", "rejectionReason", "reviewer",
+                # W7 identity. Added after the review this assertion forced.
+                #
+                # `phoneE164` is the significant one: UserType is reachable by an
+                # ADMIN through `usersPage`, so this publishes every user's phone
+                # number to administrators. That is accepted deliberately —
+                # support cannot resolve "I cannot receive my code" without
+                # seeing the number on the account, and admins already read every
+                # user's email here. It is recorded rather than assumed, because
+                # a phone number is PII the user did not choose to show and this
+                # is the field most likely to end up somewhere it should not be.
+                #
+                # What is NOT here, and must not be: the identity `subject`
+                # (see LinkedIdentityType) and `tokenVersion` (an internal
+                # revocation counter no client has any use for).
+                "phoneE164", "phoneVerifiedAt", "linkedProviders",
             },
         )
 

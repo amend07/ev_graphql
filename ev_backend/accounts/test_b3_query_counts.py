@@ -119,6 +119,18 @@ class AdminPagesDoNotScaleQueriesWithRows(QueryCountFixture):
             'usersPage', '{ usersPage(limit: %d) { items { id username role } totalCount } }',
         )
 
+    def test_users_page_is_flat_when_selecting_linked_providers(self):
+        # W7. `linkedProviders` is a reverse relation resolved per user, which is
+        # the exact shape of the B2.1 defect: correct output, cost that grows
+        # with the page. A client cannot be stopped from selecting it — the field
+        # is on UserType and UserType is what usersPage returns — so the queryset
+        # has to prefetch it whether or not today's admin console asks for it.
+        self.assert_flat(
+            'usersPage { linkedProviders }',
+            '{ usersPage(limit: %d) { items { id username linkedProviders '
+            '{ provider label verified } } totalCount } }',
+        )
+
 
 class CustomerAndOwnerPagesDoNotScaleQueriesWithRows(QueryCountFixture):
     def test_public_stations_page_is_flat(self):

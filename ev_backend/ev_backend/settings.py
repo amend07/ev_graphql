@@ -251,7 +251,35 @@ GRAPHQL_JWT = {
     "JWT_ALLOW_REFRESH": True,
     "JWT_REFRESH_EXPIRATION_DELTA": timedelta(days=config('JWT_REFRESH_DAYS', default=7, cast=int)),
     "JWT_AUTH_HEADER_PREFIX": "JWT",
+    # Session revocation (W7 §5b). The payload handler stamps the user's
+    # `token_version` into every token; the decode handler refuses tokens whose
+    # stamp no longer matches. See accounts/jwt.py for why it must be the decode
+    # handler and not the user lookup.
+    #
+    # Both are needed. With only the payload handler, tokens would carry a claim
+    # nothing reads. With only the decode handler, every token would look like
+    # generation 0 forever and `logoutEverywhere` would revoke nothing.
+    "JWT_PAYLOAD_HANDLER": "accounts.jwt.jwt_payload",
+    "JWT_DECODE_HANDLER": "accounts.jwt.jwt_decode",
 }
+
+# ── Identity & phone verification (Sprint W7) ─────────────────────────────
+#
+# Region for numbers typed without a country code. A business fact (where the
+# platform operates), not a constant — see accounts/phone.py.
+PHONE_DEFAULT_COUNTRY_CODE = config('PHONE_DEFAULT_COUNTRY_CODE', default='251')
+
+PHONE_OTP_LENGTH = config('PHONE_OTP_LENGTH', default=6, cast=int)
+PHONE_OTP_VALIDITY_MINUTES = config('PHONE_OTP_VALIDITY_MINUTES', default=10, cast=int)
+PHONE_OTP_MAX_ATTEMPTS = config('PHONE_OTP_MAX_ATTEMPTS', default=5, cast=int)
+PHONE_OTP_REQUEST_COOLDOWN_SECONDS = config('PHONE_OTP_REQUEST_COOLDOWN_SECONDS', default=60, cast=int)
+
+# SMS delivery adapter: 'disabled' (refuses, loudly) or 'console' (logs the code).
+#
+# Defaults to 'disabled' rather than 'console' even in development, because the
+# default has to be the one that is safe when someone forgets it exists. There is
+# no real provider yet; see accounts/sms.py and IDENTITY_ARCHITECTURE.md §9.2.
+SMS_BACKEND = config('SMS_BACKEND', default='disabled')
 
 # Structured authentication logging (Part 5). The accounts.auth_logging helper
 # scrubs sensitive fields, so PINs/OTPs/tokens are never written here.
@@ -389,6 +417,16 @@ if (not DEBUG and not _RUNNING_TESTS
         _problems.append('DATABASE_URL must point at a production database (SQLite is not supported in production).')
     if not CACHES.get('default'):
         _problems.append('A cache backend must be configured (set REDIS_URL for a shared cache).')
+    # ConsoleSmsBackend writes the verification code in clear text to the log.
+    # On a real deploy that puts a live credential into the log aggregator, where
+    # it is readable by everyone with log access and retained for as long as logs
+    # are — while the user believes their phone is a second factor. 'disabled' is
+    # allowed here: refusing to send is honest and is the current expected state.
+    if SMS_BACKEND == 'console':
+        _problems.append(
+            "SMS_BACKEND='console' logs verification codes in clear text and must "
+            "not be used in production. Use 'disabled' until a real provider is configured."
+        )
 
     if _problems:
         raise ImproperlyConfigured(
