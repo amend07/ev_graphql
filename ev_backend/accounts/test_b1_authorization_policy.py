@@ -84,6 +84,12 @@ MUTATION_POLICY = {
     # Signed in.
     'changePin': POLICY_AUTHENTICATED,
     'changePassword': POLICY_AUTHENTICATED,
+    # W8: naming yourself writes one field on your own record and nothing else.
+    # POLICY_AUTHENTICATED rather than POLICY_ACTIVE for the same reason as the
+    # identity mutations below — a brand-new phone account is asked for a name
+    # before it has done anything, and a deactivated user still gets to say what
+    # they are called.
+    'setDisplayName': POLICY_AUTHENTICATED,
     # Identity management, on your own account only (W7).
     #
     # POLICY_AUTHENTICATED, not POLICY_ACTIVE, and the distinction is deliberate:

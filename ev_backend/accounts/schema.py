@@ -103,6 +103,21 @@ class UserType(DjangoObjectType):
         description="Sign-in methods linked to this account. Empty list, never null.",
     )
 
+    # What a client should render (W8). Resolved, not the raw column, so it is
+    # non-null and never the `phone_9f2c…` artefact — see `User.display_label`.
+    #
+    # `username` stays in the field list below only for the legacy accounts that
+    # still sign in with one. NOTHING should render it: phase 5 removes it from
+    # the public schema, and every client that reaches for it today has to be
+    # changed anyway. Select this instead.
+    display_name = graphene.String(
+        required=True,
+        description="What to call this user. Never the internal username artefact.",
+    )
+
+    def resolve_display_name(self, info):
+        return self.display_label
+
     class Meta:
         model = User
         fields = (
@@ -249,8 +264,15 @@ class CreateUser(graphene.Mutation):
         pin = graphene.String(required=False)
         password = graphene.String(required=False)  # legacy alias
         is_station_owner = graphene.Boolean(required=False, default_value=False)
+        # Optional (W8): a username signup already has a name the user typed, so
+        # `display_label` falls back to it. Accepted here so the phone-first
+        # signup — where there is no typed username — can supply one.
+        display_name = graphene.String(required=False)
 
-    def mutate(self, info, username, email, pin=None, password=None, is_station_owner=False):
+    def mutate(
+        self, info, username, email, pin=None, password=None,
+        is_station_owner=False, display_name=None,
+    ):
         credential = pin or password
         if not credential:
             raise Exception("PIN is required.")
@@ -260,6 +282,9 @@ class CreateUser(graphene.Mutation):
             )
         except services.CredentialError as e:
             raise Exception(str(e))
+        if display_name and display_name.strip():
+            user.display_name = display_name.strip()[:60]
+            user.save(update_fields=['display_name'])
         return CreateUser(success=True, user_id=user.id, user=user)
 
 
@@ -320,6 +345,35 @@ class ResetPinWithOtp(graphene.Mutation):
         except ratelimit.RateLimitExceeded:
             return ResetPinWithOtp(success=False, message=services.GENERIC_RATE_LIMITED)
         return ResetPinWithOtp(success=success, message=message)
+
+
+class SetDisplayName(graphene.Mutation):
+    """Authenticated user sets what the app should call them (W8, §10a).
+
+    This is the step `signInWithPhone.created` exists to route to: a
+    phone-registered account has no name it chose, and until it has one the app
+    can only address it by its masked number. Separate from any other profile
+    write because it is the one field a brand-new account is asked for before it
+    reaches the app.
+
+    Idempotent, and clearing is legitimate: sending an empty string resets to
+    blank, and `display_label` falls back to the masked number again. That is a
+    real thing a user may want, so it is not an error.
+    """
+
+    success = graphene.Boolean(required=True)
+    user = graphene.Field(UserType)
+
+    class Arguments:
+        display_name = graphene.String(required=True)
+
+    @login_required
+    def mutate(self, info, display_name):
+        cleaned = ' '.join(display_name.split())[:60]
+        user = info.context.user
+        user.display_name = cleaned
+        user.save(update_fields=['display_name'])
+        return SetDisplayName(success=True, user=user)
 
 
 class ChangePin(graphene.Mutation):
@@ -908,6 +962,8 @@ class AccountsMutation(graphene.ObjectType):
     link_phone = LinkPhone.Field()
     unlink_provider = UnlinkProvider.Field()
     logout_everywhere = LogoutEverywhere.Field()
+
+    set_display_name = SetDisplayName.Field()
 
     # Canonical PIN mutations.
     send_pin_reset_otp = SendPinResetOtp.Field()

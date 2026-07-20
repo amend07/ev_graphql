@@ -79,6 +79,24 @@ class User(AbstractUser):
         help_text="Incremented by logoutEverywhere; asserted in the JWT payload.",
     )
 
+    # What to call this person (W8) — the fix §10a of IDENTITY_ARCHITECTURE.md
+    # demanded before an SMS provider is configured.
+    #
+    # `username` is an identity artefact, not a name. A phone-registered account
+    # never chose one, so `_generate_username` mints `phone_9f2c1a4b…` — and the
+    # clients render it at the user ("Welcome back, phone_9f2c1a4b8e3d0f11").
+    # This is the name a human chose; read it through `display_label`, which
+    # falls back so no client ever has to reach for `username` again.
+    #
+    # Blank rather than NULL: "never chose one" and "chose an empty string" are
+    # the same state, and blank keeps every read a `str`.
+    display_name = models.CharField(
+        max_length=60,
+        blank=True,
+        default='',
+        help_text="Human-chosen name. Blank means never set — read display_label instead.",
+    )
+
     role = models.CharField(max_length=20, choices=ROLE_CHOICES, default='user')
     owner_status = models.CharField(
         max_length=20,
@@ -117,6 +135,60 @@ class User(AbstractUser):
         default='',
         help_text="Why the owner application was rejected. Empty unless owner_status='rejected'.",
     )
+
+    # Prefixes minted by `identity._generate_username` for provider-created
+    # accounts. Kept as data rather than a regex so the check states exactly what
+    # it excludes; `test_display_label_never_returns_the_username_artefact` pins
+    # it against the real generator so the two cannot drift apart.
+    _GENERATED_USERNAME_PREFIXES = ('phone_', 'google_', 'apple_')
+
+    @property
+    def display_label(self) -> str:
+        """What to call this user — safe to render anywhere, always non-empty.
+
+        THE GUARANTEE (W8, §10a): this never returns the internal username
+        artefact. A phone account that has not chosen a name yet reads as its
+        masked number (`+251•••••3344`) rather than `phone_9f2c1a4b8e3d0f11`.
+
+        The masked number is computed here rather than stored at signup on
+        purpose: stored, it would go stale the moment the user changes their
+        number, and we would be showing an old number as a name.
+
+        Order: the name they chose ▸ their masked phone ▸ the username they
+        actually typed ▸ a neutral fallback. That last case is a provider account
+        with no phone — an OAuth signup — and 'User' is deliberately dull: it is
+        a prompt to set a name, not something anyone mistakes for their identity.
+        """
+        if self.display_name:
+            return self.display_name
+        if self.phone_e164:
+            from .phone import mask_phone
+
+            return mask_phone(self.phone_e164)
+        if not self.username.startswith(self._GENERATED_USERNAME_PREFIXES):
+            return self.username
+        return 'User'
+
+    @property
+    def public_display_label(self) -> str:
+        """What STRANGERS may call this user — a review's author, a station owner.
+
+        Deliberately NOT `display_label`, and the difference is the whole point:
+        that one falls back to the masked phone, which is correct on your own
+        dashboard and wrong on a public review. `+251•••••3344` as a byline
+        publishes the last four digits of a real number to anyone reading the
+        page, next to whatever that review says. A partial number is still PII
+        the user never chose to show.
+
+        So the phone step is simply absent here: chosen name ▸ typed username ▸
+        'User'. A phone-only account with no chosen name is anonymous in public,
+        which is the safe end of the trade.
+        """
+        if self.display_name:
+            return self.display_name
+        if not self.username.startswith(self._GENERATED_USERNAME_PREFIXES):
+            return self.username
+        return 'User'
 
     def has_verified_phone(self):
         """The check that gates anything phone-dependent.

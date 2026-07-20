@@ -49,14 +49,31 @@ class PublicUserType(graphene.ObjectType):
 
     Both clients only ever select `id`/`username` here, so this is the complete
     set they use.
+
+    `displayName` (W8) is what they should select instead. `username` is an
+    internal artefact for every provider-created account — a phone signup would
+    appear as `phone_9f2c1a4b…` in a review byline — and it stays only until both
+    clients have moved over.
     """
 
     id = graphene.ID(required=True)
     username = graphene.String(required=True)
+    display_name = graphene.String(
+        required=True,
+        description="What to call this user in public. Never a phone number, even masked.",
+    )
 
 
 def _public_user(user):
-    return PublicUserType(id=user.id, username=user.username) if user else None
+    # `public_display_label`, NOT `display_label`: the latter falls back to the
+    # masked phone, which must not become a public byline. See the model.
+    return (
+        PublicUserType(
+            id=user.id, username=user.username, display_name=user.public_display_label
+        )
+        if user
+        else None
+    )
 
 
 class StationType(DjangoObjectType):

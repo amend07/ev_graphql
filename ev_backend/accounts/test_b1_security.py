@@ -169,6 +169,14 @@ class UserTypeExposure(TestCase):
                 # (see LinkedIdentityType) and `tokenVersion` (an internal
                 # revocation counter no client has any use for).
                 "phoneE164", "phoneVerifiedAt", "linkedProviders",
+                # W8 §10a. Reviewed and added deliberately: it is a resolved
+                # label, not a new column of PII — `User.display_label` returns
+                # the chosen name, else the MASKED phone, else a typed username.
+                # It publishes nothing `username` and `phoneE164` did not already
+                # publish to this same audience, and it exists so that clients
+                # stop rendering `username`, which is an internal artefact for
+                # every provider-created account.
+                "displayName",
             },
         )
 
@@ -188,7 +196,12 @@ class UserTypeExposure(TestCase):
             self.assertNotIn(leaked, fields)
 
     def test_public_user_type_is_identity_only(self):
-        self.assertEqual(type_fields("PublicUserType"), {"id", "username"})
+        # `displayName` (W8) added deliberately. It publishes strictly LESS than
+        # the `username` beside it: `public_display_label` omits the phone step
+        # on purpose, so a phone-only account reads as 'User' in public rather
+        # than the masked number its owner sees on their own dashboard. The guard
+        # is PublicDisplayLabel in test_w8_display_name.py.
+        self.assertEqual(type_fields("PublicUserType"), {"id", "username", "displayName"})
 
     def test_booking_customer_type_carries_contact_but_nothing_privileged(self):
         self.assertEqual(
