@@ -294,6 +294,31 @@ Deferred to W8 with reasons: Google/Apple verification (no credentials), the
 Active Sessions list (needs §5a), Flutter native sign-in (needs both, plus the
 App Store rule above), and phase 4 enforcement (needs decision §9.1).
 
+### 10a. The gate on turning phone sign-in ON — read before setting `SMS_BACKEND`
+
+**Do not configure an SMS provider until a display name exists.** This is not a
+preference. It is a defect that only becomes visible once delivery works, which
+is exactly why it is written down here rather than discovered by whoever wires
+up Twilio.
+
+A phone-registered account has no username the user chose. `AbstractUser`
+requires one, so `identity._generate_username` mints an internal artefact —
+`phone_9f2c1a4b…` — hashed on purpose so that a phone number never lands in a
+field `usersPage(search:)` matches on. But `username` is still a public field and
+the web app renders it: `Welcome back, phone_9f2c1a4b8e3d0f11` on the dashboard,
+and the same string as "Username" on the profile screen.
+
+Nobody sees this today: `SMS_BACKEND='disabled'` everywhere, so `signInWithPhone`
+is unreachable and `authCapabilities.phoneSignIn` is false. The flow is built,
+tested and correctly gated — and the first person to enable a provider makes that
+string the first thing a new user sees.
+
+The fix is not a client patch. `username` is an identity artefact that phase 5
+removes from the public schema; the app needs a `displayName` a human chose,
+asked for at phone signup and defaulted to the masked number until then.
+`signInWithPhone.created` exists precisely to route that step. **W8, before any
+SMS credentials.**
+
 ---
 
 ## Appendix: what this reuses rather than rebuilds
