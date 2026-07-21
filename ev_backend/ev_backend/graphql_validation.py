@@ -50,6 +50,16 @@ def depth_limit_validator(max_depth=None):
             deepest = current
             for selection in selection_set.selections:
                 if isinstance(selection, FieldNode):
+                    # Introspection meta-fields (__schema, __type, __typename) are
+                    # exempt. The standard introspection query GraphiQL and
+                    # graphql-codegen send is depth 13 — deeper than any real data
+                    # query we permit — but it is a fixed, bounded shape, not the
+                    # nested-data / cyclic abuse this rule guards against. Counting
+                    # it would break schema fetching (and codegen) for a limit that
+                    # is meant for data traversal. A leaf __typename is depth-neutral
+                    # anyway; this also exempts a deep __schema subtree.
+                    if selection.name.value.startswith("__"):
+                        continue
                     deepest = max(deepest, self._depth(selection, current + 1, seen))
                 elif isinstance(selection, InlineFragmentNode):
                     deepest = max(deepest, self._depth(selection, current, seen))

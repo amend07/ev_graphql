@@ -131,3 +131,29 @@ class QueryDepthLimit(TestCase):
         self.assertTrue(too_strict)  # exceeds depth 1
         ok = validate(gql_schema, document, [depth_limit_validator(max_depth=5)])
         self.assertFalse(ok)         # within depth 5
+
+    def test_introspection_query_is_exempt_from_the_depth_limit(self):
+        # The standard introspection query is depth 13 — the exact one GraphiQL
+        # and graphql-codegen send. Before the exemption it 400'd against the
+        # default max of 12, breaking schema fetch. Introspection is a fixed,
+        # bounded shape, not the nested-data abuse the guard targets, so even a
+        # very tight limit must not reject it.
+        from graphql import get_introspection_query
+
+        document = parse(get_introspection_query())
+        errors = validate(
+            schema.graphql_schema, document, [depth_limit_validator(max_depth=1)]
+        )
+        self.assertFalse(errors, f"introspection was blocked: {errors}")
+
+    def test_data_fields_beneath_introspection_still_count(self):
+        # The exemption is for the introspection meta-field itself, not a licence
+        # to hide a deep data traversal beside a __typename sibling.
+        query = "{ __typename stationList { reviews { user { id } } } }"
+        document = parse(query)  # stationList->reviews->user->id = depth 4
+        self.assertTrue(
+            validate(schema.graphql_schema, document, [depth_limit_validator(max_depth=3)])
+        )
+        self.assertFalse(
+            validate(schema.graphql_schema, document, [depth_limit_validator(max_depth=4)])
+        )
