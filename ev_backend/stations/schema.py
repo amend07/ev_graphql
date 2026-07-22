@@ -21,6 +21,8 @@ from accounts.permission import (
     station_owner_required,
 )
 from ev_backend.pagination import apply_ordering, clamp_page_size, clamp_offset, paginate, window
+from notifications.models import Notification
+from notifications.service import notify
 
 # Row keys shared between the cached station list and StationListType.
 _ROW_KEYS = (
@@ -326,6 +328,15 @@ class CreateReview(graphene.Mutation):
         except IntegrityError:
             # Unique constraint lost a race — surface the same clean message.
             raise Exception("You have already reviewed this station.")
+
+        # Tell the owner their station was reviewed.
+        notify(
+            recipient=station.owner_id,
+            notification_type=Notification.TYPE_REVIEW,
+            title="New review",
+            body=f"{user.username} left a {rating}-star review on {station.name}.",
+            related_id=station.id,
+        )
         return CreateReview(review=review)
 
 

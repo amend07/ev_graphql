@@ -17,6 +17,8 @@ from accounts.permission import (
 )
 from ev_backend.errors import NotFound
 from ev_backend.pagination import apply_ordering, paginate, window
+from notifications.models import Notification
+from notifications.service import notify
 
 
 class BookingCustomerType(graphene.ObjectType):
@@ -129,6 +131,17 @@ class CreateBooking(graphene.Mutation):
                 end_time=end_time,
                 status="pending",
             )
+
+            # Tell the owner a slot was requested. Skipped for an owner booking
+            # their own station (no self-notification).
+            if station.owner_id != user.id:
+                notify(
+                    recipient=station.owner_id,
+                    notification_type=Notification.TYPE_BOOKING,
+                    title="New booking request",
+                    body=f"{user.username} requested a booking at {station.name}.",
+                    related_id=booking.id,
+                )
         return CreateBooking(booking=booking)
 
 
@@ -170,6 +183,16 @@ class UpdateBookingStatus(graphene.Mutation):
                 booking.cancel_reason = cancel_reason
             booking.save(update_fields=["status", "cancel_reason"])
 
+            # Let the customer know their booking moved.
+            outcome = {"approved": "approved", "rejected": "rejected", "done": "completed"}[status]
+            notify(
+                recipient=booking.user_id,
+                notification_type=Notification.TYPE_BOOKING,
+                title=f"Booking {outcome}",
+                body=f"Your booking at {booking.station.name} was {outcome}.",
+                related_id=booking.id,
+            )
+
         return UpdateBookingStatus(booking=booking)
 
 
@@ -199,6 +222,17 @@ class CancelBooking(graphene.Mutation):
             booking.status = "cancelled"
             booking.cancel_reason = cancel_reason or "Cancelled by user"
             booking.save(update_fields=["status", "cancel_reason"])
+
+            # Let the owner know a slot freed up. (station is not select_related
+            # here, so owner_id costs one extra query — acceptable for a cancel.)
+            if booking.station.owner_id != user.id:
+                notify(
+                    recipient=booking.station.owner_id,
+                    notification_type=Notification.TYPE_BOOKING,
+                    title="Booking cancelled",
+                    body=f"{user.username} cancelled their booking at {booking.station.name}.",
+                    related_id=booking.id,
+                )
 
         return CancelBooking(booking=booking)
 

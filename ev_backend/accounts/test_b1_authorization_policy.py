@@ -38,6 +38,9 @@ QUERY_POLICY = {
     'myFavorites': POLICY_AUTHENTICATED,
     'myBookings': POLICY_AUTHENTICATED,
     'myBookingsPage': POLICY_AUTHENTICATED,
+    # Notifications: your own, for any signed-in user (customer/owner/admin).
+    'myNotificationsPage': POLICY_AUTHENTICATED,
+    'myUnreadNotificationCount': POLICY_AUTHENTICATED,
     # Owner: another party's data, scoped to a station you own.
     'stationBookings': POLICY_OWNER,
     # Admin.
@@ -106,6 +109,9 @@ MUTATION_POLICY = {
     'signInWithGoogle': POLICY_PUBLIC,
     'signInWithApple': POLICY_PUBLIC,
     'setMyPhone': POLICY_AUTHENTICATED,
+    # Notifications: mark your own read; any signed-in user.
+    'markNotificationRead': POLICY_AUTHENTICATED,
+    'markAllNotificationsRead': POLICY_AUTHENTICATED,
     # Active account required for anything that writes domain data.
     'createBooking': POLICY_ACTIVE,
     'cancelBooking': POLICY_ACTIVE,

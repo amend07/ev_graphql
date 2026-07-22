@@ -38,6 +38,7 @@ from ev_backend.schema import schema
 from stations.models import Favorite, Review, Station
 
 from .models import AuditLog, PasswordResetOTP
+from notifications.models import Notification
 
 User = get_user_model()
 
@@ -75,6 +76,7 @@ COLLECTIONS = {
     'myFavorites': Collection(PAGE, actor='customer'),
     'myBookings': Collection(WINDOW, actor='customer'),
     'myBookingsPage': Collection(PAGE, actor='customer'),
+    'myNotificationsPage': Collection(PAGE, actor='customer'),
     # Owner: bookings on a station you own.
     'stationBookings': Collection(WINDOW, actor='owner', args={'bookingId': 'station'}),
     # Admin.
@@ -233,6 +235,10 @@ class CollectionFixture(TestCase):
                 )
 
         for i in range(SEEDED):
+            Notification.objects.create(
+                recipient=cls.customer, notification_type=Notification.TYPE_SYSTEM,
+                title=f'N{i}', body='seed',
+            )
             PasswordResetOTP.objects.create(
                 user=cls.customers[i], otp_hash='x', expires_at=now + timedelta(minutes=10),
             )

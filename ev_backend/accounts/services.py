@@ -66,7 +66,25 @@ def create_account(username, email, pin, is_station_owner=False, request=None):
         owner_status=owner_status,
     )
     log_event("account_created", request=request, user=user, role=role)
+    _notify_admins_of_new_owner(user, is_station_owner)
     return user
+
+
+def _notify_admins_of_new_owner(user, is_station_owner):
+    """A new station-owner signup lands in the admin approval queue, so tell the
+    admins. Imported locally: `accounts` loads before `notifications`, so a
+    module-level import could hit the app registry too early."""
+    if not is_station_owner:
+        return
+    from notifications.models import Notification
+    from notifications.service import notify_admins
+
+    notify_admins(
+        notification_type=Notification.TYPE_STATION,
+        title="New station owner awaiting approval",
+        body=f"{user.username} signed up as a station owner and needs review.",
+        related_id=user.id,
+    )
 
 
 def _internal_username_for_phone(phone_e164):
@@ -152,6 +170,7 @@ def create_phone_account(phone, email, pin, is_station_owner=False, request=None
     )
 
     log_event("account_created", request=request, user=user, role=role, method="phone_pin")
+    _notify_admins_of_new_owner(user, is_station_owner)
     return user
 
 

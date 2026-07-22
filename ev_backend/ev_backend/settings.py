@@ -34,6 +34,7 @@ INSTALLED_APPS = [
     'bookings',
     'accounts',
     'stations',
+    'notifications',
     'corsheaders',
 ]
 

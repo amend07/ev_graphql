@@ -16,6 +16,8 @@ from ev_backend.errors import Conflict, NotFound, ValidationError
 
 from . import audit
 from .models import AuditLog, User
+from notifications.models import Notification
+from notifications.service import notify
 
 
 def get_target(user_id):
@@ -292,6 +294,14 @@ def approve_owner(*, actor, target, request=None):
         'owner_status', 'reviewer', 'reviewed_at', 'rejection_reason',
     ])
 
+    notify(
+        recipient=target,
+        notification_type=Notification.TYPE_SYSTEM,
+        title="You're approved as a station owner",
+        body="Your station owner account has been approved. "
+             "You can now add and manage stations.",
+    )
+
     audit.record_user_action(
         actor=actor,
         action=AuditLog.ACTION_OWNER_APPROVED,
@@ -333,6 +343,13 @@ def reject_owner(*, actor, target, reason, request=None):
     target.save(update_fields=[
         'owner_status', 'reviewer', 'reviewed_at', 'rejection_reason',
     ])
+
+    notify(
+        recipient=target,
+        notification_type=Notification.TYPE_SYSTEM,
+        title="Station owner application declined",
+        body=f"Your station owner application was not approved: {reason}",
+    )
 
     audit.record_user_action(
         actor=actor,
