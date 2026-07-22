@@ -14,6 +14,9 @@ graphql-relay==3.2.0
 
 # --- Auth / utils ---
 PyJWT==2.10.1
+# Required by PyJWT to verify RS256 Google/Apple ID tokens (W8 social sign-in,
+# accounts/social.py; PyJWKClient fetches each provider's JWKS).
+cryptography==49.0.0
 python-decouple==3.8
 promise==2.3
 python-dateutil==2.9.0.post0

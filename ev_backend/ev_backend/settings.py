@@ -281,6 +281,17 @@ PHONE_OTP_REQUEST_COOLDOWN_SECONDS = config('PHONE_OTP_REQUEST_COOLDOWN_SECONDS'
 # no real provider yet; see accounts/sms.py and IDENTITY_ARCHITECTURE.md §9.2.
 SMS_BACKEND = config('SMS_BACKEND', default='disabled')
 
+# Social sign-in (W8). Comma-separated OAuth client IDs that a token's `aud` must
+# match — the anti-forgery control in accounts/social.py. Empty (the default)
+# means the provider is not configured: verification refuses and authCapabilities
+# reports it false, so no client offers the button. A deployment enables Google
+# or Apple purely by setting these; nothing else toggles.
+#
+# Google typically needs one ID per client platform (web, Android, iOS) — list
+# all of them. Apple's is the Services ID (web) and/or the app's bundle ID.
+GOOGLE_OAUTH_CLIENT_IDS = config('GOOGLE_OAUTH_CLIENT_IDS', default='', cast=Csv())
+APPLE_CLIENT_IDS = config('APPLE_CLIENT_IDS', default='', cast=Csv())
+
 # Structured authentication logging (Part 5). The accounts.auth_logging helper
 # scrubs sensitive fields, so PINs/OTPs/tokens are never written here.
 # All handlers write to stdout, which is log-rotation friendly (the container/

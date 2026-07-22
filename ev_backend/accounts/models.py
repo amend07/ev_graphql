@@ -257,6 +257,144 @@ class PhoneVerification(models.Model):
         return f"PhoneVerification({self.phone_e164})"
 
 
+class EmailVerification(models.Model):
+    """An email OTP proving control of an address at SIGNUP (Sprint W8).
+
+    A sibling of ``PasswordResetOTP``, not a reuse of it, for the same reason
+    ``PhoneVerification`` is a sibling and not a reuse: same hardening, different
+    subject, different consequence. ``PasswordResetOTP`` is bound to an existing
+    ``user`` — you already have an account, prove the mailbox to reset its PIN.
+    This one exists BEFORE any account, because signup is the first time the
+    platform meets the person. Binding to a user here is impossible (there is no
+    user yet), so it is keyed on the email string, exactly as
+    ``PhoneVerification`` is keyed on the number.
+
+    WHY EMAIL AND NOT SMS for a phone-first product: there is no SMS provider
+    (see sms.py, and docs/IDENTITY_ARCHITECTURE.md §9.2). The signup code is
+    delivered to the email collected alongside the phone. This proves the EMAIL,
+    not the handset — so an account created this way leaves ``phone_verified_at``
+    NULL and gets no verified ``phone`` identity. The phone is canonical (it is
+    the login key and is UNIQUE) but claimed, not proven. Recording a phone
+    verification that never happened would be a lie the identity-linking rules
+    would later trust, which is the mistake ``AuthIdentity.verified_at`` exists to
+    avoid.
+
+    Separate table from ``PasswordResetOTP`` on purpose: a code minted to reset a
+    PIN must not be spendable to register an account, and vice versa. Sharing a
+    table would make a code for one purpose valid for the other — a privilege
+    change for the price of a typo, the same hazard ``PhoneVerification`` cites.
+
+    The security design is copied wholesale from ``PasswordResetOTP`` because that
+    design is right: the plaintext code is never stored, verification is
+    constant-time and attempt-limited, and the record dies on success, expiry or
+    exhaustion. Do not re-derive it.
+    """
+
+    #: The address being proven. Not a FK — see the class docstring: at signup we
+    #: do not yet have (or want) a user row to hang this off.
+    email = models.EmailField(db_index=True)
+    otp_hash = models.CharField(max_length=128)
+    created_at = models.DateTimeField(auto_now_add=True)
+    expires_at = models.DateTimeField()
+    attempts = models.PositiveSmallIntegerField(default=0)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['email', '-created_at'], name='emailverif_lookup_idx'),
+        ]
+
+    # Delivery is email, same as PasswordResetOTP, so the same OTP_* knobs govern
+    # it. Phone's separate PHONE_OTP_* knobs exist because SMS has different cost
+    # and cooldown economics; email does not, so reusing these keeps one dial.
+    @staticmethod
+    def validity_minutes():
+        return getattr(settings, 'OTP_VALIDITY_MINUTES', 10)
+
+    @staticmethod
+    def max_attempts():
+        return getattr(settings, 'OTP_MAX_ATTEMPTS', 5)
+
+    @staticmethod
+    def cooldown_seconds():
+        return getattr(settings, 'OTP_REQUEST_COOLDOWN_SECONDS', 60)
+
+    @staticmethod
+    def otp_length():
+        return getattr(settings, 'OTP_LENGTH', 6)
+
+    @classmethod
+    def can_request(cls, email):
+        """Cooldown gate. Returns ``(allowed, seconds_remaining)``."""
+        latest = cls.objects.filter(email__iexact=email).order_by('-created_at').first()
+        if latest is None:
+            return True, 0
+        elapsed = (timezone.now() - latest.created_at).total_seconds()
+        cooldown = cls.cooldown_seconds()
+        if elapsed < cooldown:
+            return False, int(cooldown - elapsed)
+        return True, 0
+
+    @classmethod
+    def generate_for_email(cls, email):
+        """Mint a fresh code, store only its hash, and email it once.
+
+        Sends within this method — like ``PasswordResetOTP`` and unlike
+        ``PhoneVerification`` — because email delivery is Django's ``send_mail``
+        with one obvious backend, not a swappable adapter that can legitimately
+        refuse. ``fail_silently=False`` propagates a delivery failure so the
+        caller can roll the row back rather than leave a cooldown behind for a
+        code nobody received.
+        """
+        cls.objects.filter(email__iexact=email).delete()  # invalidate any prior code
+
+        # secrets, not random: an OTP is a credential for its validity window.
+        code = "".join(secrets.choice("0123456789") for _ in range(cls.otp_length()))
+
+        instance = cls.objects.create(
+            email=email,
+            otp_hash=make_password(code),
+            expires_at=timezone.now() + timezone.timedelta(minutes=cls.validity_minutes()),
+        )
+        instance._send_email(code)  # plaintext used transiently for delivery only
+        return instance
+
+    def is_expired(self):
+        return timezone.now() > self.expires_at
+
+    def verify(self, supplied):
+        """``"ok"`` | ``"expired"`` | ``"locked"`` | ``"invalid"``. Single-use."""
+        if self.is_expired():
+            self.delete()
+            return 'expired'
+
+        if check_password(str(supplied), self.otp_hash):
+            self.delete()
+            return 'ok'
+
+        type(self).objects.filter(pk=self.pk).update(attempts=models.F('attempts') + 1)
+        self.refresh_from_db(fields=['attempts'])
+        if self.attempts >= self.max_attempts():
+            self.delete()
+            return 'locked'
+        return 'invalid'
+
+    def _send_email(self, code):
+        context = {"otp": code, "minutes": self.validity_minutes()}
+        txt_message = render_to_string("accounts/emails/signup_otp.txt", context)
+        html_message = render_to_string("accounts/emails/signup_otp.html", context)
+        send_mail(
+            subject="Your EV Charge Hub verification code",
+            message=txt_message,
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            recipient_list=[self.email],
+            html_message=html_message,
+            fail_silently=False,
+        )
+
+    def __str__(self):
+        return f"EmailVerification({self.email})"
+
+
 class AuthIdentity(models.Model):
     """One way a user can prove who they are (Sprint W7).
 

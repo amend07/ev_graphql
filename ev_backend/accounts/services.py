@@ -9,17 +9,20 @@ Security properties enforced here: 6-digit PIN policy, hashed credentials
 constant-time OTP handling, and structured audit logging.
 """
 
+import hashlib
 import logging
 
 from django.contrib.auth import get_user_model, update_session_auth_hash
 from django.contrib.auth.hashers import check_password, make_password
 from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import ValidationError
+from django.db import transaction
 from django.utils import timezone
 
 from . import ratelimit
 from .auth_logging import log_event
-from .models import PasswordResetOTP
+from .models import AuthIdentity, PasswordResetOTP
+from .phone import normalize_phone
 
 User = get_user_model()
 
@@ -27,6 +30,9 @@ User = get_user_model()
 GENERIC_OTP_SENT = "If the email is registered, a reset code has been sent."
 GENERIC_OTP_INVALID = "Invalid or expired code."
 GENERIC_RATE_LIMITED = "Too many attempts. Please try again later."
+# One message for "unknown number" and "wrong PIN" alike (W8), matching the
+# wording tokenAuth already returns so the two login paths are indistinguishable.
+GENERIC_INVALID_CREDENTIALS = "Please enter valid credentials"
 
 # Pre-computed hash used to keep verification timing constant when there is no
 # OTP (or user) for the supplied email — defeats timing-based enumeration.
@@ -60,6 +66,134 @@ def create_account(username, email, pin, is_station_owner=False, request=None):
         owner_status=owner_status,
     )
     log_event("account_created", request=request, user=user, role=role)
+    return user
+
+
+def _internal_username_for_phone(phone_e164):
+    """A stable, internal, non-guessable username for a phone-first account.
+
+    Username stays required by ``AbstractUser`` but is no longer an identity a
+    person types — phone is (W8). It is derived from the number rather than
+    random so it is stable and debuggable, and HASHED rather than raw so the
+    number never lands in a field ``usersPage(search:)`` matches on. Same reasoning
+    as ``identity._generate_username``; kept separate because this account is not
+    created through the provider-identity path.
+    """
+    digest = hashlib.sha256(f'phone:{phone_e164}'.encode()).hexdigest()[:16]
+    return f'phone_{digest}'
+
+
+def validate_new_phone_account(phone, email, pin):
+    """Validate a prospective phone+PIN signup WITHOUT creating anything.
+
+    Returns the normalised E.164 so a caller need not normalise twice. Split out
+    so ``registerWithPhone`` can run it BEFORE spending the single-use email OTP:
+    a weak PIN or an already-registered number must not cost the caller their
+    code — the same rule ``reset_pin`` keeps when it validates the new PIN before
+    burning a correct OTP.
+
+    Uniqueness is ultimately a DB guarantee (``phone_e164`` is UNIQUE); these
+    checks exist to return a specific message instead of a caught IntegrityError
+    that cannot say which column collided.
+    """
+    e164 = normalize_phone(phone)  # raises ValidationError on an unparseable number
+
+    try:
+        validate_password(pin)
+    except ValidationError as e:
+        raise CredentialError("; ".join(e.messages))
+
+    if User.objects.filter(phone_e164=e164).exists():
+        raise CredentialError("That phone number is already registered.")
+    if User.objects.filter(email__iexact=email).exists():
+        raise CredentialError("Email already registered")
+    return e164
+
+
+@transaction.atomic
+def create_phone_account(phone, email, pin, is_station_owner=False, request=None):
+    """Register a phone-first account (W8). Phone is the canonical identity.
+
+    Called only after ``email_service.verify_signup_otp`` has proven the email,
+    so the account starts with a PROVEN email and a CLAIMED-not-proven phone: no
+    SMS provider exists to prove the handset (sms.py), so ``phone_verified_at``
+    stays NULL and no verified ``phone`` identity is created. The phone is still
+    canonical — it is UNIQUE and it is the login key — it is simply not marked
+    proven, because it was not. See docs/IDENTITY_ARCHITECTURE.md §9.2.
+
+    The credential is a 6-digit PIN, hashed, exposed to the identity system as a
+    ``password`` provider exactly as the legacy login is (migration 0009), so the
+    last-identity and unlink rules treat a phone+PIN account uniformly.
+    """
+    e164 = validate_new_phone_account(phone, email, pin)
+
+    role = "station_owner" if is_station_owner else "user"
+    owner_status = User.OWNER_PENDING if is_station_owner else None
+
+    username = _internal_username_for_phone(e164)
+    user = User.objects.create_user(
+        username=username,
+        email=email,
+        password=pin,          # hashed by create_user; never plaintext
+        role=role,
+        owner_status=owner_status,
+        phone_e164=e164,       # canonical, but unproven — see docstring
+        phone_verified_at=None,
+    )
+
+    # The PIN login, modelled as a provider so a phone+PIN account is one identity
+    # among several (mirrors migration 0009 for legacy accounts). verified_at is
+    # NULL: the OTP proved the email, not that this username belongs to a human.
+    AuthIdentity.objects.create(
+        user=user,
+        provider=AuthIdentity.PROVIDER_PASSWORD,
+        subject=username,
+        verified_at=None,
+    )
+
+    log_event("account_created", request=request, user=user, role=role, method="phone_pin")
+    return user
+
+
+def authenticate_phone_pin(phone, pin, request=None):
+    """Return the user for a valid phone + PIN, else raise (W8).
+
+    The primary sign-in path: phone is the canonical identity, the PIN is the
+    credential. Raises ``CredentialError`` for any authentication failure and
+    ``ratelimit.RateLimitExceeded`` when throttled — the caller translates both,
+    exactly as ``signInWithPhone`` does.
+
+    Generic and timing-equalised: an unknown number and a wrong PIN return the
+    same message and take the same time (a dummy hash comparison runs when there
+    is no user), so this is not an oracle for "is this number registered". A phone
+    space is small and dense enough to walk, which is why the equalisation matters
+    more here than for email. Rate-limited per IP and per NORMALISED number, so
+    the three ways to write one number cannot each spend their own budget.
+    """
+    ip = ratelimit.get_client_ip(request)
+    ratelimit.enforce("LOGIN", ip, "ip")
+
+    try:
+        e164 = normalize_phone(phone)
+    except Exception:
+        # Unparseable: cannot match an account. Do not distinguish it from a wrong
+        # credential, but still burn time so the endpoint is not a parser oracle.
+        check_password(str(pin), _DUMMY_OTP_HASH)
+        log_event("login_failure", request=request, method="phone_pin")
+        raise CredentialError(GENERIC_INVALID_CREDENTIALS)
+
+    ratelimit.enforce("LOGIN", e164, "account")
+
+    user = User.objects.filter(phone_e164=e164).first()
+    if user is None or not user.check_password(pin):
+        if user is None:
+            check_password(str(pin), _DUMMY_OTP_HASH)  # equalise timing
+        log_event("login_failure", request=request, method="phone_pin")
+        raise CredentialError(GENERIC_INVALID_CREDENTIALS)
+
+    ratelimit.reset("LOGIN", ip, "ip")
+    ratelimit.reset("LOGIN", e164, "account")
+    log_event("login_success", request=request, user=user, method="phone_pin")
     return user
 
 

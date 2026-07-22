@@ -16,6 +16,7 @@ from django.utils import timezone
 from ev_backend.errors import Conflict, NotFound, ValidationError
 
 from .models import AuthIdentity, User
+from .phone import normalize_phone
 
 
 def find_by_identity(provider, subject):
@@ -200,6 +201,36 @@ def attach_phone(*, user, phone_e164):
             identity.verified_at = timezone.now()
             identity.save(update_fields=['subject', 'verified_at'])
 
+    return user
+
+
+def set_unverified_phone(*, user, phone_e164):
+    """Attach a CLAIMED (not proven) phone to an account (W8).
+
+    The path a Google/Apple signup takes: the provider proved who they are, we
+    then ask for a phone for contact and booking, and there is no SMS to prove it
+    (sms.py). So this sets the canonical number WITHOUT a ``phone_verified_at``
+    and WITHOUT creating a ``phone`` identity — an identity row asserts a proof
+    that did not happen, and ``sign_in_with_identity`` would later trust it.
+
+    Contrast ``attach_phone``, which is the OTP-backed path: it stamps
+    ``phone_verified_at`` and writes a verified ``phone`` identity because a code
+    was actually spent. The two must not converge — an unverified number that
+    reads as verified is exactly the lie the identity model refuses elsewhere.
+
+    Uniqueness is still enforced: the number is canonical and the login space, so
+    two accounts cannot claim it even unproven. The explicit check turns the
+    unique-constraint IntegrityError into a message the caller can show.
+    """
+    e164 = normalize_phone(phone_e164)
+
+    clash = User.objects.filter(phone_e164=e164).exclude(pk=user.pk).exists()
+    if clash:
+        raise Conflict("That phone number is already in use on another account.")
+
+    user.phone_e164 = e164
+    # Deliberately NOT setting phone_verified_at: it was not proven.
+    user.save(update_fields=['phone_e164'])
     return user
 
 

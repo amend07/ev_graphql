@@ -596,10 +596,14 @@ class PhoneFlowWithNoProvider(TestCase):
         with self.assertRaises(SmsUnavailable):
             phone_service.send_phone_otp('0911223344', request=Context())
 
-    def test_the_api_reports_phone_sign_in_as_unavailable(self):
+    def test_phone_pin_sign_in_stays_available_without_an_sms_provider(self):
+        # W8 redefined `phoneSignIn`: it now reports phone+PIN (the primary
+        # method), which needs no SMS. So it is TRUE even here, where SMS is
+        # disabled — what this deployment lacks is the passwordless phone-OTP path,
+        # not phone sign-in itself.
         result = schema.execute('{ authCapabilities { phoneSignIn } }', context=Context())
         self.assertIsNone(result.errors)
-        self.assertFalse(result.data['authCapabilities']['phoneSignIn'])
+        self.assertTrue(result.data['authCapabilities']['phoneSignIn'])
 
 
 class AuthCapabilitiesTellTheTruth(TestCase):
@@ -615,8 +619,11 @@ class AuthCapabilitiesTellTheTruth(TestCase):
         self.assertTrue(result.data['authCapabilities']['passwordSignIn'])
 
     @override_settings(SMS_BACKEND='console')
-    def test_phone_availability_follows_real_configuration(self):
-        # Not a constant: it moves when the deployment moves.
+    def test_phone_sign_in_no_longer_depends_on_the_sms_backend(self):
+        # W8: `phoneSignIn` reports phone+PIN availability, independent of the SMS
+        # backend — true with console configured, and (see PhoneFlowWithNoProvider)
+        # true with no provider at all. Google/Apple are the capabilities that now
+        # move with configuration.
         result = schema.execute('{ authCapabilities { phoneSignIn } }', context=Context())
         self.assertTrue(result.data['authCapabilities']['phoneSignIn'])
 

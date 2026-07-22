@@ -1,0 +1,13 @@
+Welcome to EV Charge Hub!
+
+Use the following code to finish creating your account:
+
+Code: {{ otp }}
+
+This code is valid for {{ minutes }} minutes. We will never ask you for it.
+
+If you did not try to create an account, you can safely ignore this email.
+
+— EV Charge Hub Team
+
+This is an automated message, please do not reply to this email.

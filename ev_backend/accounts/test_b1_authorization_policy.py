@@ -94,6 +94,18 @@ MUTATION_POLICY = {
     'linkPhone': POLICY_AUTHENTICATED,
     'unlinkProvider': POLICY_AUTHENTICATED,
     'logoutEverywhere': POLICY_AUTHENTICATED,
+    # Phone + PIN and social sign-in (W8). The sign-in / signup entry points are
+    # public for the same reason tokenAuth is — the caller has no session yet —
+    # and are hardened by rate limiting, single-use emailed OTPs, generic
+    # timing-equalised replies (phone+PIN), and provider token verification with
+    # an audience allow-list (Google/Apple). setMyPhone is the one signed-in
+    # member: it writes to your own account.
+    'sendSignupOtp': POLICY_PUBLIC,
+    'registerWithPhone': POLICY_PUBLIC,
+    'signInWithPhonePin': POLICY_PUBLIC,
+    'signInWithGoogle': POLICY_PUBLIC,
+    'signInWithApple': POLICY_PUBLIC,
+    'setMyPhone': POLICY_AUTHENTICATED,
     # Active account required for anything that writes domain data.
     'createBooking': POLICY_ACTIVE,
     'cancelBooking': POLICY_ACTIVE,

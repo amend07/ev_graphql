@@ -10,10 +10,9 @@ from graphql_jwt.shortcuts import get_token
 
 from .permission import admin_required, login_required, public
 from .models import AuditLog, AuthIdentity, PasswordResetOTP
-from . import administration, identity, phone_service, services, ratelimit
+from . import administration, email_service, identity, phone_service, services, ratelimit, social
 from .auth_logging import log_event
 from .phone import mask_phone
-from .sms import sms_configured
 from ev_backend.errors import ValidationError
 from ev_backend.pagination import apply_ordering, hard_cap, paginate
 # `stations.schema` imports `accounts.permission`, never `accounts.schema`, so
@@ -724,13 +723,18 @@ class AuthCapabilitiesType(graphene.ObjectType):
     """What sign-in methods this deployment can ACTUALLY perform right now.
 
     Exists so a client can disable a button and say why, instead of offering a
-    flow that is guaranteed to fail. Read from real configuration, not from
-    intent: `phoneSignIn` is false whenever no SMS provider is wired, which is
-    the default today.
+    flow that is guaranteed to fail. Read from real configuration, not intent.
+
+    `phoneSignIn` means phone+PIN sign-in (W8), which needs no SMS provider and is
+    the primary method — so it is a constant true, not the W7 `sms_configured()`
+    check (passwordless phone-OTP is a separate, secondary path). `googleSignIn`
+    and `appleSignIn` are true only when that provider's client IDs are
+    configured; with none set, verification cannot succeed and the button must not
+    be offered (see accounts/social.py).
     """
 
     phone_sign_in = graphene.Boolean(
-        required=True, description="Whether a phone code can actually be delivered."
+        required=True, description="Whether phone + PIN sign-in is available."
     )
     google_sign_in = graphene.Boolean(required=True, description="Whether Google sign-in is available.")
     apple_sign_in = graphene.Boolean(required=True, description="Whether Apple sign-in is available.")
@@ -870,6 +874,196 @@ class LogoutEverywhere(graphene.Mutation):
         return LogoutEverywhere(success=True)
 
 
+# ── Phone + PIN and social sign-in (Sprint W8) ───────────────────────────────
+#
+# W7 made phone the canonical identity and shipped passwordless phone-OTP sign-in
+# against an SMS seam that still has no provider. W8 makes phone + PIN the PRIMARY
+# credential (no SMS needed to sign in) and adds Google and Apple, so the three
+# options a client offers are: phone+PIN, Google, Apple.
+#
+# Signup proves the person with an EMAILED code (email_service), not an SMS one —
+# there is still no SMS provider — so the phone is collected as canonical but
+# unproven. As everywhere else, handlers stay thin over the service layer.
+
+
+class SendSignupOtp(graphene.Mutation):
+    """Email a verification code to begin phone + PIN signup.
+
+    Public: signup has no session by definition. The reply is identical whether or
+    not the address is already registered (email_service's enumeration rule); the
+    "already registered" answer comes later, from registerWithPhone, after a code
+    has been proven — never from an unauthenticated send that would otherwise be a
+    free "is this email registered here" oracle.
+    """
+
+    success = graphene.Boolean()
+    message = graphene.String()
+
+    class Arguments:
+        email = graphene.String(required=True)
+
+    @public
+    def mutate(self, info, email):
+        try:
+            message = email_service.send_signup_otp(email, request=info.context)
+        except ratelimit.RateLimitExceeded:
+            raise ValidationError(services.GENERIC_RATE_LIMITED)
+        return SendSignupOtp(success=True, message=message)
+
+
+class RegisterWithPhone(graphene.Mutation):
+    """Create a phone + PIN account after proving the email with a code (W8).
+
+    Phone is the canonical login identity; the email is proven by the code; the
+    PIN is the credential. Returns a session so the client goes straight into the
+    app, exactly like signInWithPhone.
+
+    The prospective account is validated (parseable number, PIN policy, no
+    duplicate phone/email) BEFORE the single-use code is spent, so a weak PIN or an
+    already-registered number does not cost the caller their one-time code — the
+    rule reset_pin keeps for a bad new PIN.
+    """
+
+    token = graphene.String(description="JWT, as tokenAuth returns.")
+    user = graphene.Field(UserType)
+
+    class Arguments:
+        phone = graphene.String(required=True, description="Any common format; normalised to E.164 server-side.")
+        email = graphene.String(required=True)
+        pin = graphene.String(required=True)
+        otp = graphene.String(required=True, description="The code emailed by sendSignupOtp.")
+        is_station_owner = graphene.Boolean(required=False, default_value=False)
+
+    @public
+    def mutate(self, info, phone, email, pin, otp, is_station_owner=False):
+        # Cheap checks first so a predictable failure does not burn the code.
+        try:
+            services.validate_new_phone_account(phone, email, pin)
+        except services.CredentialError as e:
+            raise ValidationError(str(e))
+
+        try:
+            email_verified = email_service.verify_signup_otp(email, otp, request=info.context)
+        except ratelimit.RateLimitExceeded:
+            raise ValidationError(services.GENERIC_RATE_LIMITED)
+
+        try:
+            user = services.create_phone_account(
+                phone, email_verified, pin, is_station_owner, request=info.context,
+            )
+        except services.CredentialError as e:
+            raise ValidationError(str(e))
+
+        return RegisterWithPhone(token=get_token(user), user=user)
+
+
+class SignInWithPhonePin(graphene.Mutation):
+    """The primary sign-in: phone + PIN in exchange for a session (W8).
+
+    Generic and rate-limited (services.authenticate_phone_pin): an unknown number
+    and a wrong PIN are one message and one timing, so this cannot be walked as an
+    account-existence oracle.
+    """
+
+    token = graphene.String(description="JWT, as tokenAuth returns.")
+    user = graphene.Field(UserType)
+
+    class Arguments:
+        phone = graphene.String(required=True)
+        pin = graphene.String(required=True)
+
+    @public
+    def mutate(self, info, phone, pin):
+        try:
+            user = services.authenticate_phone_pin(phone, pin, request=info.context)
+        except services.CredentialError as e:
+            raise ValidationError(str(e))
+        except ratelimit.RateLimitExceeded:
+            raise ValidationError(services.GENERIC_RATE_LIMITED)
+        return SignInWithPhonePin(token=get_token(user), user=user)
+
+
+class SetMyPhone(graphene.Mutation):
+    """Attach a phone to the signed-in account, UNVERIFIED (W8).
+
+    The step after a Google/Apple signup: the provider proved who they are, and we
+    then collect a phone for contact and booking. There is no SMS to prove it
+    (sms.py), so the number is stored as canonical-but-claimed — `phoneVerifiedAt`
+    stays NULL and no `phone` identity is written. This is deliberately NOT
+    linkPhone, which spends an OTP and DOES mark the number proven; conflating the
+    two would let an unverified number read as verified.
+
+    Uniqueness is still enforced (the number is the login space), so two accounts
+    cannot claim it even unproven.
+    """
+
+    success = graphene.Boolean()
+    user = graphene.Field(UserType)
+
+    class Arguments:
+        phone = graphene.String(required=True, description="Any common format; normalised to E.164 server-side.")
+
+    @login_required
+    def mutate(self, info, phone):
+        user = identity.set_unverified_phone(user=info.context.user, phone_e164=phone)
+        log_event('phone_set_unverified', request=info.context, user=user)
+        return SetMyPhone(success=True, user=user)
+
+
+class SignInWithGoogle(graphene.Mutation):
+    """Verify a Google ID token and return a session, creating the account if new.
+
+    Mirrors signInWithPhone's shape: a provider identity we have seen returns to
+    its owner, one we have not becomes a new account (never an existing one matched
+    by email — see identity.sign_in_with_identity). `created` lets the client route
+    a first-time user to the phone-collection step (setMyPhone).
+
+    The token is verified in accounts/social.py; whose account it is, is decided in
+    accounts/identity.py. This handler only wires the two together.
+    """
+
+    token = graphene.String(description="JWT, as tokenAuth returns.")
+    user = graphene.Field(UserType)
+    created = graphene.Boolean(description="True if this call registered a new account.")
+
+    class Arguments:
+        id_token = graphene.String(required=True, description="The Google OIDC ID token from the client.")
+
+    @public
+    def mutate(self, info, id_token):
+        subject, email = social.verify_google_id_token(id_token)
+        user, created = identity.sign_in_with_identity(
+            provider=AuthIdentity.PROVIDER_GOOGLE, subject=subject, email=email,
+        )
+        log_event('login_success', request=info.context, user=user, method='google')
+        return SignInWithGoogle(token=get_token(user), user=user, created=created)
+
+
+class SignInWithApple(graphene.Mutation):
+    """Verify an Apple identity token and return a session, creating if new.
+
+    Same shape as signInWithGoogle. Apple sends an email only on the FIRST
+    authorisation, so `email` may be empty on later sign-ins — which is fine, the
+    account already exists by then, keyed on the provider subject.
+    """
+
+    token = graphene.String(description="JWT, as tokenAuth returns.")
+    user = graphene.Field(UserType)
+    created = graphene.Boolean(description="True if this call registered a new account.")
+
+    class Arguments:
+        identity_token = graphene.String(required=True, description="The Apple OIDC identity token from the client.")
+
+    @public
+    def mutate(self, info, identity_token):
+        subject, email = social.verify_apple_identity_token(identity_token)
+        user, created = identity.sign_in_with_identity(
+            provider=AuthIdentity.PROVIDER_APPLE, subject=subject, email=email,
+        )
+        log_event('login_success', request=info.context, user=user, method='apple')
+        return SignInWithApple(token=get_token(user), user=user, created=created)
+
+
 class AccountsQuery(graphene.ObjectType):
     me = graphene.Field(UserType)
     auth_capabilities = graphene.Field(
@@ -885,15 +1079,14 @@ class AccountsQuery(graphene.ObjectType):
     @public
     def resolve_auth_capabilities(self, info):
         return AuthCapabilitiesType(
-            # Real: reflects whether an SMS adapter is actually configured.
-            phone_sign_in=sms_configured(),
-            # Honest constants, not placeholders. There is no Google/Apple client
-            # ID, no token verification path, and nothing to toggle — so these
-            # report false rather than pretending to be configurable. W8 replaces
-            # them with a real check once credentials exist; until then a client
-            # that offers those buttons is offering nothing.
-            google_sign_in=False,
-            apple_sign_in=False,
+            # Phone + PIN needs no SMS and is the primary method (W8): always on.
+            phone_sign_in=True,
+            # Real checks now (W8): true exactly when the provider's client IDs are
+            # configured, so a client offers a button only when the token behind it
+            # can actually be verified. No credentials => false => no button.
+            google_sign_in=social.google_enabled(),
+            apple_sign_in=social.apple_enabled(),
+            # Legacy username/PIN sign-in still works for pre-W8 accounts.
             password_sign_in=True,
         )
 
@@ -908,6 +1101,14 @@ class AccountsMutation(graphene.ObjectType):
     link_phone = LinkPhone.Field()
     unlink_provider = UnlinkProvider.Field()
     logout_everywhere = LogoutEverywhere.Field()
+
+    # Phone + PIN and social sign-in (W8).
+    send_signup_otp = SendSignupOtp.Field()
+    register_with_phone = RegisterWithPhone.Field()
+    sign_in_with_phone_pin = SignInWithPhonePin.Field()
+    set_my_phone = SetMyPhone.Field()
+    sign_in_with_google = SignInWithGoogle.Field()
+    sign_in_with_apple = SignInWithApple.Field()
 
     # Canonical PIN mutations.
     send_pin_reset_otp = SendPinResetOtp.Field()
