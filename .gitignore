@@ -15,6 +15,8 @@ ENV/
 *.log
 db.sqlite3
 db.sqlite3-journal
+# Local DB backups/snapshots (e.g. db.sqlite3.bak-w8reset)
+db.sqlite3.*
 /ev_backend/media/
 /ev_backend/staticfiles/
 ev_backend/media/
