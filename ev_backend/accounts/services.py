@@ -210,6 +210,13 @@ def authenticate_phone_pin(phone, pin, request=None):
         log_event("login_failure", request=request, method="phone_pin")
         raise CredentialError(GENERIC_INVALID_CREDENTIALS)
 
+    # Coming back after a self-delete: a correct credential restores the soft-
+    # deleted account (data intact) and the sign-in continues (W9).
+    from . import administration
+    if user.is_deleted:
+        administration.restore_account(user, request=request)
+        log_event("account_restored", request=request, user=user, method="phone_pin")
+
     ratelimit.reset("LOGIN", ip, "ip")
     ratelimit.reset("LOGIN", e164, "account")
     log_event("login_success", request=request, user=user, method="phone_pin")

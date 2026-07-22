@@ -9,7 +9,7 @@ without also recording it, because it does not do the deleting.
 """
 
 from django.db import transaction
-from django.db.models import Avg, Count, Q
+from django.db.models import Avg, Count, F, Q
 from django.utils import timezone
 
 from ev_backend.errors import Conflict, NotFound, ValidationError
@@ -181,6 +181,64 @@ def delete_user(*, actor, target, request=None):
         target.delete()
 
     return summary
+
+
+def soft_delete_own_account(*, user, request=None):
+    """Self-service account deletion (W9) — a SOFT delete.
+
+    Deliberately NOT `delete_user`: that one is an admin hard-cascading someone
+    ELSE (and asserts the actor is not the target). Here the user deletes
+    themselves and their data is KEPT so they can come back: the account is
+    stamped ``deleted_at``, set inactive, and its sessions are invalidated
+    (``token_version`` bumped). Signing in again restores it — see
+    ``restore_account``.
+
+    The last-admin guard stays — a sole admin removing themselves would leave the
+    platform unadministrable — refused with the same message an admin-initiated
+    attempt gets.
+    """
+    _assert_not_last_admin(user, "delete")
+
+    with transaction.atomic():
+        audit.record_user_action(
+            actor=user,
+            action=AuditLog.ACTION_USER_DELETED,
+            target_user=user,
+            request=request,
+            target_role=user.role,
+            self_service=True,
+            soft=True,
+        )
+        user.deleted_at = timezone.now()
+        user.is_active = False
+        user.token_version = F('token_version') + 1
+        user.save(update_fields=['deleted_at', 'is_active', 'token_version'])
+        user.refresh_from_db(fields=['token_version'])
+
+    return user
+
+
+def restore_account(user, request=None):
+    """Reverse a soft delete on a successful sign-in. No-op if not deleted.
+
+    Returns True if it actually restored, so the caller can log the event. The
+    account's data was never removed, so restoring is just clearing the stamp and
+    reactivating — the user resumes exactly where they left off."""
+    if user.deleted_at is None:
+        return False
+    user.deleted_at = None
+    user.is_active = True
+    user.save(update_fields=['deleted_at', 'is_active'])
+    audit.record_user_action(
+        actor=user,
+        action=AuditLog.ACTION_USER_ACTIVATED,
+        target_user=user,
+        request=request,
+        target_role=user.role,
+        self_service=True,
+        restored=True,
+    )
+    return True
 
 
 def _period_starts(now=None):

@@ -79,6 +79,17 @@ class User(AbstractUser):
         help_text="Incremented by logoutEverywhere; asserted in the JWT payload.",
     )
 
+    # Self-service account deletion (W9) is a SOFT delete: the row and all the
+    # user's data are kept, the account is set inactive, and this stamp records
+    # when. Signing back in with the same credentials clears it and picks up
+    # exactly where they left off. Distinct from is_active on purpose — an
+    # admin-deactivated (banned) account has is_active=False but deleted_at NULL,
+    # and must NOT be auto-restored by a login the way a self-deleted one is.
+    deleted_at = models.DateTimeField(
+        null=True, blank=True, default=None,
+        help_text="When the user self-deleted. NULL = active account. Set = soft-deleted, restorable on sign-in.",
+    )
+
     role = models.CharField(max_length=20, choices=ROLE_CHOICES, default='user')
     owner_status = models.CharField(
         max_length=20,
@@ -135,6 +146,11 @@ class User(AbstractUser):
     def is_approved_owner(self):
         """The check that actually gates station management."""
         return self.role == 'station_owner' and self.owner_status == self.OWNER_APPROVED
+
+    @property
+    def is_deleted(self):
+        """True while the account is soft-deleted (self-service, restorable)."""
+        return self.deleted_at is not None
 
     def __str__(self):
         return f"{self.username} ({self.role})"

@@ -13,7 +13,7 @@ from .models import AuditLog, AuthIdentity, PasswordResetOTP
 from . import administration, email_service, identity, phone_service, services, ratelimit, social
 from .auth_logging import log_event
 from .phone import mask_phone
-from ev_backend.errors import ValidationError
+from ev_backend.errors import Conflict, ValidationError
 from ev_backend.pagination import apply_ordering, hard_cap, paginate
 # `stations.schema` imports `accounts.permission`, never `accounts.schema`, so
 # this direction does not cycle. PublicUserType is the identity-only audience
@@ -220,6 +220,17 @@ class CustomObtainJSONWebToken(graphql_jwt.JSONWebTokenMutation):
             if found:
                 username = found.username
 
+        # A self-deleted account is inactive, which Django's auth backend (used by
+        # super().mutate) would reject before we could react. So restore it here,
+        # on a CORRECT credential only, so the sign-in that follows succeeds and
+        # the user resumes where they left off (W9 soft delete).
+        if username:
+            candidate = User.objects.filter(username=username).first()
+            if candidate and candidate.is_deleted and candidate.check_password(credential):
+                administration.restore_account(candidate, request=request)
+                log_event("account_restored", request=request, user=candidate,
+                          method="username_pin")
+
         try:
             result = super().mutate(root, info, username=username, password=credential)
         except Exception:
@@ -336,6 +347,53 @@ class ChangePin(graphene.Mutation):
             info.context.user, current_pin, new_pin, request=info.context
         )
         return ChangePin(success=success, message=message)
+
+
+class DeleteMyAccount(graphene.Mutation):
+    """Self-service account deletion (W9). PIN-confirmed, SOFT and restorable.
+
+    The PIN is re-verified even though the caller is authenticated: deletion is
+    consequential, so proof of the credential — not merely a live session — is
+    required, the bar `changePin` sets. Wrong PIN is rate-limited per account and
+    IP so the confirmation cannot be brute-forced.
+
+    The delete is SOFT: the account and its data are kept and the user can restore
+    everything by signing in again (see the login mutations). The reply says so.
+    """
+
+    success = graphene.Boolean()
+    message = graphene.String()
+
+    class Arguments:
+        pin = graphene.String(required=True)
+
+    @login_required
+    def mutate(self, info, pin):
+        user = info.context.user
+        ip = ratelimit.get_client_ip(info.context)
+        try:
+            ratelimit.enforce("LOGIN", ip, "ip")
+            ratelimit.enforce("LOGIN", str(user.pk), "account")
+        except ratelimit.RateLimitExceeded:
+            return DeleteMyAccount(success=False, message=services.GENERIC_RATE_LIMITED)
+
+        if not user.check_password(pin):
+            log_event("account_delete_failed", request=info.context, user=user,
+                      reason="wrong_pin")
+            return DeleteMyAccount(success=False, message="Incorrect PIN.")
+
+        try:
+            administration.soft_delete_own_account(user=user, request=info.context)
+        except Conflict as e:
+            # e.g. the last admin cannot delete themselves.
+            return DeleteMyAccount(success=False, message=str(e))
+
+        ratelimit.reset("LOGIN", ip, "ip")
+        log_event("account_deleted", request=info.context, user=user, method="self_service")
+        return DeleteMyAccount(
+            success=True,
+            message="Your account has been deleted. Sign in again anytime to restore it.",
+        )
 
 
 # ── Deprecated password-named aliases (existing Flutter client) ──────────────
@@ -1114,6 +1172,7 @@ class AccountsMutation(graphene.ObjectType):
     send_pin_reset_otp = SendPinResetOtp.Field()
     reset_pin_with_otp = ResetPinWithOtp.Field()
     change_pin = ChangePin.Field()
+    delete_my_account = DeleteMyAccount.Field()
 
     # Deprecated password-named aliases (backward compatibility).
     send_password_reset_otp = SendPasswordResetOtp.Field()

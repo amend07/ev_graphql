@@ -94,6 +94,8 @@ MUTATION_POLICY = {
     # Signed in.
     'changePin': POLICY_AUTHENTICATED,
     'changePassword': POLICY_AUTHENTICATED,
+    # Self-service account deletion (W9): PIN-confirmed, your own account.
+    'deleteMyAccount': POLICY_AUTHENTICATED,
     # Identity management, on your own account only (W7).
     #
     # POLICY_AUTHENTICATED, not POLICY_ACTIVE, and the distinction is deliberate:

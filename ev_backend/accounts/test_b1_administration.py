@@ -487,3 +487,85 @@ class AuditLogQuery(TestCase):
     def test_anonymous_cannot_read_the_trail(self):
         res = run(self.QUERY)
         self.assertIsNotNone(res.get("errors"))
+
+
+class SelfServiceAccountDeletion(TestCase):
+    """W9. A user soft-deletes their OWN account, PIN-confirmed, and can restore
+    it by signing in again — their data is kept, not cascaded away."""
+
+    MUTATION = """
+        mutation($pin: String!) {
+          deleteMyAccount(pin: $pin) { success message }
+        }
+    """
+    LOGIN = """
+        mutation($u: String!, $pin: String!) {
+          tokenAuth(username: $u, pin: $pin) { token user { id isActive } }
+        }
+    """
+
+    def setUp(self):
+        self.user = make_user("selfdel")
+
+    def test_correct_pin_soft_deletes_the_account(self):
+        res = run(self.MUTATION, user=self.user, pin="123456")
+        self.assertIsNone(res.get("errors"), res.get("errors"))
+        self.assertTrue(res["data"]["deleteMyAccount"]["success"])
+        # Row kept, but inactive and stamped.
+        self.user.refresh_from_db()
+        self.assertTrue(self.user.is_deleted)
+        self.assertFalse(self.user.is_active)
+
+    def test_deletion_is_audited_as_self_service_soft(self):
+        run(self.MUTATION, user=self.user, pin="123456")
+        entry = AuditLog.objects.filter(
+            action=AuditLog.ACTION_USER_DELETED, actor_username="selfdel",
+        ).first()
+        self.assertIsNotNone(entry)
+        self.assertTrue(entry.metadata.get("self_service"))
+        self.assertTrue(entry.metadata.get("soft"))
+
+    def test_wrong_pin_is_refused_and_keeps_the_account_active(self):
+        res = run(self.MUTATION, user=self.user, pin="000000")
+        self.assertIsNone(res.get("errors"))
+        self.assertFalse(res["data"]["deleteMyAccount"]["success"])
+        self.assertIn("PIN", res["data"]["deleteMyAccount"]["message"])
+        self.user.refresh_from_db()
+        self.assertFalse(self.user.is_deleted)
+
+    def test_soft_delete_keeps_the_users_data(self):
+        station = make_station(make_user("otherowner", role="station_owner"))
+        Booking.objects.create(
+            user=self.user, station=station, status="approved",
+            start_time=timezone.now(), end_time=timezone.now() + timedelta(hours=1),
+        )
+        run(self.MUTATION, user=self.user, pin="123456")
+        # Data survives the soft delete.
+        self.assertTrue(Booking.objects.filter(user_id=self.user.id).exists())
+
+    def test_signing_in_again_restores_the_account_and_data(self):
+        station = make_station(make_user("otherowner2", role="station_owner"))
+        Booking.objects.create(
+            user=self.user, station=station, status="approved",
+            start_time=timezone.now(), end_time=timezone.now() + timedelta(hours=1),
+        )
+        run(self.MUTATION, user=self.user, pin="123456")
+        # Come back with the same username + PIN.
+        res = run(self.LOGIN, u="selfdel", pin="123456")
+        self.assertIsNone(res.get("errors"), res.get("errors"))
+        self.assertIsNotNone(res["data"]["tokenAuth"]["token"])
+        self.assertTrue(res["data"]["tokenAuth"]["user"]["isActive"])
+        self.user.refresh_from_db()
+        self.assertFalse(self.user.is_deleted)
+        self.assertTrue(Booking.objects.filter(user_id=self.user.id).exists())
+
+    def test_the_last_admin_cannot_self_delete(self):
+        admin = make_user("soleadmin", role="admin")
+        res = run(self.MUTATION, user=admin, pin="123456")
+        self.assertFalse(res["data"]["deleteMyAccount"]["success"])
+        admin.refresh_from_db()
+        self.assertFalse(admin.is_deleted)
+
+    def test_requires_authentication(self):
+        res = run(self.MUTATION, pin="123456")
+        self.assertIsNotNone(res.get("errors"))
