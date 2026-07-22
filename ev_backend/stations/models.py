@@ -1,3 +1,5 @@
+import secrets
+
 from django.db import models
 from django.db.models.functions import Coalesce
 from django.conf import settings
@@ -89,6 +91,14 @@ class Station(models.Model):
     estimated_time_min = models.PositiveIntegerField(default=30)
     price_per_kwh = models.DecimalField(max_digits=6, decimal_places=2)
     charger_brand = models.CharField(max_length=50, blank=True)
+    # Opaque code printed in the charger's QR sticker (W9 charging sessions).
+    # Resolves a physical charger back to this station when a customer scans to
+    # start a session. Auto-generated on first save; unique. A station currently
+    # carries ONE code — per-connector codes would need a separate Charger model.
+    charger_code = models.CharField(
+        max_length=32, unique=True, null=True, blank=True, default=None,
+        db_index=True,
+    )
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -114,6 +124,24 @@ class Station(models.Model):
                 name="station_power_positive",
             ),
         ]
+
+    @staticmethod
+    def _new_charger_code():
+        # ~14 url-safe chars: opaque and non-guessable, but the access check is
+        # the booking/auth on startChargingSession, not the code's secrecy — it
+        # lives on a physical sticker anyone at the charger can read.
+        return secrets.token_urlsafe(10)
+
+    def save(self, *args, **kwargs):
+        if not self.charger_code:
+            # Uniqueness is guaranteed by the column; the loop only avoids the
+            # astronomically unlikely collision raising to the caller.
+            for _ in range(5):
+                candidate = self._new_charger_code()
+                if not Station.objects.filter(charger_code=candidate).exists():
+                    self.charger_code = candidate
+                    break
+        super().save(*args, **kwargs)
 
     def __str__(self):
         return f"{self.name} - {self.location}"

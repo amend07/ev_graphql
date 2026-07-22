@@ -45,6 +45,9 @@ QUERY_POLICY = {
     'myNotificationPreferences': POLICY_AUTHENTICATED,
     # Your own garage (W9): any signed-in user.
     'myVehiclesPage': POLICY_AUTHENTICATED,
+    # Charging sessions (W9): your own live session, scoped to you in the resolver.
+    'chargingSession': POLICY_AUTHENTICATED,
+    'myActiveChargingSession': POLICY_AUTHENTICATED,
     # Owner: another party's data, scoped to a station you own.
     'stationBookings': POLICY_OWNER,
     # Admin.
@@ -130,6 +133,9 @@ MUTATION_POLICY = {
     'updateVehicle': POLICY_ACTIVE,
     'setPrimaryVehicle': POLICY_ACTIVE,
     'deleteVehicle': POLICY_ACTIVE,
+    # Charging sessions (W9): starting/stopping needs an active account.
+    'startChargingSession': POLICY_ACTIVE,
+    'stopChargingSession': POLICY_ACTIVE,
     # Approved station owner.
     'createStation': POLICY_OWNER,
     'updateStation': POLICY_OWNER,

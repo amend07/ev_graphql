@@ -14,6 +14,7 @@ from stations.schema import (
 from bookings.schema import BookingAdminQuery, BookingMutation, BookingQuery
 from notifications.schema import NotificationMutation, NotificationQuery
 from vehicles.schema import VehicleMutation, VehicleQuery
+from charging.schema import ChargingMutation, ChargingQuery
 
 
 class Query(
@@ -25,6 +26,7 @@ class Query(
     BookingAdminQuery,
     NotificationQuery,
     VehicleQuery,
+    ChargingQuery,
     graphene.ObjectType,
 ):
     pass
@@ -38,6 +40,7 @@ class Mutation(
     StationAdminMutation,
     NotificationMutation,
     VehicleMutation,
+    ChargingMutation,
     graphene.ObjectType,
 ):
     token_auth = AccountsMutation.token_auth

@@ -36,6 +36,7 @@ INSTALLED_APPS = [
     'stations',
     'notifications',
     'vehicles',
+    'charging',
     'corsheaders',
 ]
 
@@ -345,6 +346,14 @@ BOOKING_MIN_DURATION_MINUTES = config('BOOKING_MIN_DURATION_MINUTES', default=15
 BOOKING_MAX_DURATION_HOURS = config('BOOKING_MAX_DURATION_HOURS', default=4, cast=int)
 # Owners booking their own station is disallowed by default (business rule).
 BOOKING_ALLOW_OWNER_SELF_BOOKING = config('BOOKING_ALLOW_OWNER_SELF_BOOKING', default=False, cast=bool)
+
+# Charging sessions (W9).
+# Walk-up (charging without an approved booking) is OFF by default: a session
+# must be authorised by an approved booking for the station.
+CHARGING_ALLOW_WALKUP = config('CHARGING_ALLOW_WALKUP', default=False, cast=bool)
+# Simulated charger: seconds of charging until a "full" auto-complete. Real
+# hardware reports full itself; this only governs the SimulatedChargerGateway.
+CHARGING_SIM_FULL_SECONDS = config('CHARGING_SIM_FULL_SECONDS', default=3600, cast=int)
 
 # Station (Part 3) — upper bounds for sanity/DoS protection.
 STATION_MAX_DESCRIPTION_LENGTH = config('STATION_MAX_DESCRIPTION_LENGTH', default=2000, cast=int)

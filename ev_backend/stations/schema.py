@@ -97,7 +97,7 @@ class StationType(DjangoObjectType):
             "location", "latitude", "longitude", "availability", "amenities",
             "charger_type", "charge_mode", "station_count", "num_of_charger",
             "power_output_kw", "estimated_time_min", "price_per_kwh",
-            "charger_brand", "created_at",
+            "charger_brand", "charger_code", "created_at",
         )
 
     def resolve_owner(self, info):
