@@ -224,3 +224,279 @@ class FavoriteValidation(StationTestBase):
         # Toggling removes rather than creating a duplicate.
         self._toggle(self.user)
         self.assertEqual(Favorite.objects.filter(user=self.user, station=self.station).count(), 0)
+
+
+# ── Validator unit tests (stations/validators.py) ────────────────────────────
+
+from stations import validators as V  # noqa: E402
+
+
+@override_settings(
+    STATION_MAX_DESCRIPTION_LENGTH=20,
+    STATION_MAX_PRICE_PER_KWH=100,
+    STATION_MAX_POWER_KW=400,
+    STATION_MAX_CHARGERS=10,
+    REVIEW_MIN_RATING=1,
+    REVIEW_MAX_RATING=5,
+    REVIEW_MAX_COMMENT_LENGTH=20,
+)
+class ValidatorTests(TestCase):
+    def _bad(self, fn, *args):
+        with self.assertRaises(V.InvalidInput):
+            fn(*args)
+
+    def test_name_bounds(self):
+        self._bad(V.validate_name, "")
+        self._bad(V.validate_name, None)
+        self._bad(V.validate_name, "x" * 101)
+        V.validate_name("Fine name")  # ok
+
+    def test_location_bounds(self):
+        self._bad(V.validate_location, "   ")
+        self._bad(V.validate_location, "x" * 256)
+        V.validate_location("Somewhere")
+
+    def test_description_too_long(self):
+        self._bad(V.validate_description, "x" * 21)
+        V.validate_description(None)          # optional
+        V.validate_description("short")
+
+    def test_latitude_and_longitude(self):
+        self._bad(V.validate_latitude, None)
+        self._bad(V.validate_latitude, 91.0)
+        self._bad(V.validate_longitude, None)
+        self._bad(V.validate_longitude, -181.0)
+        V.validate_latitude(9.0)
+        V.validate_longitude(38.0)
+
+    def test_normalize_charger_type_aliases_and_passthrough(self):
+        self.assertEqual(V.normalize_charger_type("Type 2"), "type2")
+        self.assertEqual(V.normalize_charger_type("GB/T"), "gb_t")
+        self.assertEqual(V.normalize_charger_type("Tesla"), "nacs")
+        self.assertEqual(V.normalize_charger_type("j1772"), "type1")
+        self.assertEqual(V.normalize_charger_type("banana"), "banana")  # unrecognised
+        self.assertIsNone(V.normalize_charger_type(None))               # non-str early return
+        self.assertEqual(V.normalize_charger_type(123), 123)
+
+    def test_validate_charger_type(self):
+        V.validate_charger_type("")           # optional, skipped
+        V.validate_charger_type("ccs2")       # ok
+        self._bad(V.validate_charger_type, "banana")
+
+    def test_normalize_and_validate_charge_mode(self):
+        self.assertEqual(V.normalize_charge_mode(" DC "), "dc")
+        self.assertIsNone(V.normalize_charge_mode(None))
+        V.validate_charge_mode("")            # optional
+        V.validate_charge_mode("ac")          # ok
+        self._bad(V.validate_charge_mode, "turbo")
+
+    def test_validate_price(self):
+        V.validate_price(None)                # optional
+        V.validate_price(5.0)
+        self._bad(V.validate_price, -1.0)
+        self._bad(V.validate_price, 101.0)
+
+    def test_validate_power(self):
+        V.validate_power(None)
+        V.validate_power(50.0)
+        self._bad(V.validate_power, 0.0)
+        self._bad(V.validate_power, 401.0)
+
+    def test_validate_charger_count(self):
+        V.validate_charger_count(None)
+        V.validate_charger_count(3)
+        self._bad(V.validate_charger_count, 0)
+        self._bad(V.validate_charger_count, 11)
+
+    def test_validate_rating_and_comment(self):
+        self._bad(V.validate_rating, None)
+        self._bad(V.validate_rating, 6)
+        V.validate_rating(3)
+        self._bad(V.validate_comment, "x" * 21)
+        V.validate_comment(None)
+        V.validate_comment("fine")
+
+    def test_station_input_requires_price_on_create(self):
+        self._bad(V.validate_station_input, {"name": "A", "location": "L",
+                                             "latitude": 1.0, "longitude": 2.0})
+
+    def test_station_input_full_create_and_partial_update(self):
+        # A complete, valid create payload exercises every optional branch.
+        V.validate_station_input({
+            "name": "A", "location": "L", "latitude": 1.0, "longitude": 2.0,
+            "price_per_kwh": 5.0, "description": "ok", "charger_type": "ccs",
+            "charge_mode": "dc", "power_output_kw": 50.0, "num_of_charger": 2,
+            "station_count": 1,
+        })
+        # Partial update: only provided fields are checked; a bad one still fails.
+        self._bad(lambda d: V.validate_station_input(d, partial=True),
+                  {"num_of_charger": 0})
+
+
+# ── Schema branch coverage (stations/schema.py) ──────────────────────────────
+
+CREATE_STATION_MODE = (
+    "mutation($in:CreateStationInput!){ createStation(input:$in)"
+    "{ station { id chargeMode } } }"
+)
+UPDATE_STATION = (
+    "mutation($id:ID!,$in:CreateStationInput!){ updateStation(stationId:$id, input:$in)"
+    "{ station { id name } } }"
+)
+STATION_BY_ID = (
+    "query($id:ID!){ stationById(stationId:$id){ id isFavorite } }"
+)
+FILTER = """
+query($ct:String,$cm:String,$noc:Int,$minR:Float,$maxR:Float,$minP:Float,
+      $maxP:Float,$minPr:Float,$maxPr:Float,$avail:String){
+  filterStations(chargerType:$ct, chargeMode:$cm, numOfCharger:$noc,
+                 minRating:$minR, maxRating:$maxR, minPower:$minP, maxPower:$maxP,
+                 minPrice:$minPr, maxPrice:$maxPr, availability:$avail){ stationId }
+}
+"""
+
+
+class StationSchemaBranchTests(StationTestBase):
+    def setUp(self):
+        super().setUp()
+        self.driver = make_user("driver")
+        self.active = make_station(
+            self.owner, name="Active", location="A", charger_type="ccs",
+            charge_mode="dc", num_of_charger=2, power_output_kw=50.0, price_per_kwh=5,
+        )
+        self.inactive = make_station(
+            self.owner, name="Inactive", location="B", charger_type="type2",
+            charge_mode="ac", num_of_charger=1, power_output_kw=22.0,
+            price_per_kwh=9, is_active=False,
+        )
+
+    def _filter(self, **vars):
+        res = self.client.execute(FILTER, variables=vars, context=self.ctx(AnonymousUser()))
+        self.assertIsNone(res.get("errors"), res.get("errors"))
+        return res["data"]["filterStations"]
+
+    def test_create_station_normalizes_charge_mode(self):
+        payload = dict(VALID_INPUT)
+        payload.update(name="Norm", location="Z", chargeMode="DC")
+        res = self.client.execute(
+            CREATE_STATION_MODE, variables={"in": payload}, context=self.ctx(self.owner))
+        self.assertIsNone(res.get("errors"), res.get("errors"))
+        self.assertEqual(res["data"]["createStation"]["station"]["chargeMode"], "dc")
+
+    def test_update_station_applies_input(self):
+        res = self.client.execute(
+            UPDATE_STATION,
+            variables={"id": str(self.active.id),
+                       "in": dict(VALID_INPUT, name="Renamed", location="A")},
+            context=self.ctx(self.owner),
+        )
+        self.assertIsNone(res.get("errors"), res.get("errors"))
+        self.active.refresh_from_db()
+        self.assertEqual(self.active.name, "Renamed")
+
+    def test_update_station_invalid_input_rejected(self):
+        res = self.client.execute(
+            UPDATE_STATION,
+            variables={"id": str(self.active.id),
+                       "in": dict(VALID_INPUT, latitude=999.0)},
+            context=self.ctx(self.owner),
+        )
+        self.assertIsNotNone(res.get("errors"))
+
+    def test_delete_station_not_found(self):
+        q = "mutation($id:ID!){ deleteStation(stationId:$id){ ok } }"
+        res = self.client.execute(q, variables={"id": "999999"}, context=self.ctx(self.owner))
+        self.assertIsNotNone(res.get("errors"))
+
+    def test_create_review_station_not_found(self):
+        q = ("mutation($s:ID!,$r:Int!){ createReview(stationId:$s, rating:$r){ review { id } } }")
+        res = self.client.execute(q, variables={"s": "999999", "r": 5}, context=self.ctx(self.driver))
+        self.assertIsNotNone(res.get("errors"))
+
+    def test_update_and_delete_review_not_found(self):
+        upd = "mutation($id:ID!,$r:Int!){ updateReview(reviewId:$id, rating:$r){ review { id } } }"
+        self.assertIsNotNone(
+            self.client.execute(upd, variables={"id": "999999", "r": 3},
+                                context=self.ctx(self.driver)).get("errors"))
+        dele = "mutation($id:ID!){ deleteReview(reviewId:$id){ ok } }"
+        self.assertIsNotNone(
+            self.client.execute(dele, variables={"id": "999999"},
+                                context=self.ctx(self.driver)).get("errors"))
+
+    def test_update_review_changes_rating_and_comment(self):
+        done_booking(self.driver, self.active)
+        Review.objects.create(user=self.driver, station=self.active, rating=3, comment="meh")
+        review = Review.objects.get(user=self.driver, station=self.active)
+        upd = ("mutation($id:ID!,$r:Int!,$c:String){ updateReview(reviewId:$id, rating:$r, comment:$c)"
+               "{ review { id rating } } }")
+        res = self.client.execute(
+            upd, variables={"id": str(review.id), "r": 5, "c": "better"},
+            context=self.ctx(self.driver))
+        self.assertIsNone(res.get("errors"), res.get("errors"))
+        review.refresh_from_db()
+        self.assertEqual(review.rating, 5)
+        self.assertEqual(review.comment, "better")
+
+    def test_station_by_id_not_found(self):
+        res = self.client.execute(STATION_BY_ID, variables={"id": "999999"},
+                                  context=self.ctx(AnonymousUser()))
+        self.assertIsNotNone(res.get("errors"))
+
+    def test_is_favorite_reflects_authenticated_user(self):
+        Favorite.objects.create(user=self.driver, station=self.active)
+        res = self.client.execute(STATION_BY_ID, variables={"id": str(self.active.id)},
+                                  context=self.ctx(self.driver))
+        self.assertTrue(res["data"]["stationById"]["isFavorite"])
+        # Anonymous callers always see False.
+        res2 = self.client.execute(STATION_BY_ID, variables={"id": str(self.active.id)},
+                                   context=self.ctx(AnonymousUser()))
+        self.assertFalse(res2["data"]["stationById"]["isFavorite"])
+
+    def test_filter_by_charger_type_and_mode(self):
+        rows = self._filter(ct="ccs")
+        self.assertEqual({r["stationId"] for r in rows}, {str(self.active.id)})
+        rows = self._filter(cm="dc")
+        self.assertEqual({r["stationId"] for r in rows}, {str(self.active.id)})
+
+    def test_filter_by_num_power_and_price_bounds(self):
+        self.assertTrue(self._filter(noc=2))
+        self.assertTrue(self._filter(minP=40.0, maxP=60.0))
+        self.assertTrue(self._filter(minPr=1.0, maxPr=8.0))
+
+    def test_filter_by_rating_bounds(self):
+        # No ratings yet, so average is 0.0 — a min above 0 excludes everything.
+        self.assertEqual(self._filter(minR=1.0), [])
+        self.assertTrue(self._filter(maxR=5.0))
+
+    def test_availability_scopes(self):
+        # available -> active only; occupied -> inactive only; all -> both.
+        available = {r["stationId"] for r in self._filter(avail="available")}
+        self.assertIn(str(self.active.id), available)
+        self.assertNotIn(str(self.inactive.id), available)
+
+        occupied = {r["stationId"] for r in self._filter(avail="occupied")}
+        self.assertEqual(occupied, {str(self.inactive.id)})
+
+        every = {r["stationId"] for r in self._filter(avail="all")}
+        self.assertIn(str(self.active.id), every)
+        self.assertIn(str(self.inactive.id), every)
+
+    def test_station_list_marks_favorites_for_authenticated_user(self):
+        from stations.cache import get_public_station_rows  # noqa: F401
+        Favorite.objects.create(user=self.driver, station=self.active)
+        q = "query{ stationList { stationId isFavorite } }"
+        res = self.client.execute(q, context=self.ctx(self.driver))
+        self.assertIsNone(res.get("errors"), res.get("errors"))
+        favs = {r["stationId"]: r["isFavorite"] for r in res["data"]["stationList"]}
+        self.assertTrue(favs.get(str(self.active.id)))
+
+
+class StationAdminFilterTests(StationTestBase):
+    def test_stations_page_admin_min_rating_filter(self):
+        admin = make_user("admin", role="admin")
+        make_station(self.owner, name="S1", location="L1")
+        q = ("query($r:Float){ stationsPageAdmin(minRating:$r){ totalCount items { name } } }")
+        res = self.client.execute(q, variables={"r": 1.0}, context=self.ctx(admin))
+        self.assertIsNone(res.get("errors"), res.get("errors"))
+        # No reviews -> average_rate 0 -> nothing meets minRating 1.
+        self.assertEqual(res["data"]["stationsPageAdmin"]["totalCount"], 0)

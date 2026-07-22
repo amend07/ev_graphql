@@ -243,3 +243,58 @@ class ActiveSessionTests(ChargingBase):
     def test_no_active_session_returns_null(self):
         res = self.client.execute(ACTIVE, context=self.ctx(self.driver))
         self.assertIsNone(res["data"]["myActiveChargingSession"])
+
+
+from unittest import mock  # noqa: E402
+
+from django.db import IntegrityError  # noqa: E402
+
+from charging.gateway import ChargerError  # noqa: E402
+
+
+class ServiceEdgeTests(ChargingBase):
+    def test_named_booking_that_is_not_approved_is_refused(self):
+        # A pending booking's id does not authorise charging.
+        pending = Booking.objects.create(
+            user=self.driver, station=self.station, status="pending",
+            start_time=timezone.now(), end_time=timezone.now() + timedelta(hours=1),
+        )
+        with self.assertRaises(service.ChargingError):
+            service.start_session(
+                user=self.driver, charger_code=self.station.charger_code,
+                booking_id=pending.id,
+            )
+
+    def test_gateway_refusal_becomes_a_charging_error(self):
+        self.approved_booking()
+
+        class Refusing:
+            def start(self, *, station, charger_code):
+                raise ChargerError("charger offline")
+
+        with mock.patch("charging.service.get_charger_gateway", return_value=Refusing()):
+            with self.assertRaises(service.ChargingError):
+                service.start_session(
+                    user=self.driver, charger_code=self.station.charger_code)
+
+    def test_lost_race_on_create_is_a_charging_error(self):
+        self.approved_booking()
+        with mock.patch(
+            "charging.service.ChargingSession.objects.create",
+            side_effect=IntegrityError("dup active session"),
+        ):
+            with self.assertRaises(service.ChargingError):
+                service.start_session(
+                    user=self.driver, charger_code=self.station.charger_code)
+
+    def test_refresh_and_interruption_are_noops_on_a_finished_session(self):
+        self.approved_booking()
+        session = ChargingSession.objects.get(
+            id=self.start()["sessionId"])
+        session.status = ChargingSession.STATUS_COMPLETED
+        session.save(update_fields=["status"])
+        # Both early-return the already-finished session unchanged.
+        self.assertEqual(service.refresh_session(session).status,
+                         ChargingSession.STATUS_COMPLETED)
+        self.assertEqual(service.report_interruption(session).status,
+                         ChargingSession.STATUS_COMPLETED)

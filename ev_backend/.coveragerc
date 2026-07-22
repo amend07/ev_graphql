@@ -1,0 +1,21 @@
+[run]
+source = accounts,stations,bookings,notifications,vehicles,charging,ev_backend
+omit =
+    */migrations/*
+    */tests.py
+    */test_*.py
+    */__init__.py
+    manage.py
+    ev_backend/asgi.py
+    ev_backend/wsgi.py
+    ev_backend/settings.py
+    */admin.py
+    */apps.py
+    */views.py
+[report]
+exclude_lines =
+    pragma: no cover
+    raise NotImplementedError
+    if __name__ == .__main__.:
+    def __str__
+    def __repr__

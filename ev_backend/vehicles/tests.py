@@ -161,3 +161,45 @@ class VehiclePrimaryTests(VehicleBase):
         self.assertIsNone(res.get("errors"), res.get("errors"))
         self.assertTrue(res["data"]["updateVehicle"]["vehicle"]["isPrimary"])
         self.assertFalse(Vehicle.objects.get(id=first["id"]).is_primary)
+
+
+class VehicleValidationBranchTests(VehicleBase):
+    def _add_err(self, **over):
+        res = self.client.execute(
+            ADD, variables={"input": valid_input(**over)}, context=self.ctx(self.alice))
+        self.assertIsNotNone(res.get("errors"))
+
+    def test_required_fields_rejected_when_blank(self):
+        self._add_err(make="   ")
+        self._add_err(model="")
+        self._add_err(plateNumber="   ")
+
+    def test_battery_capacity_bounds(self):
+        self._add_err(batteryCapacityKwh=0.0)     # must be > 0
+        self._add_err(batteryCapacityKwh=9999.0)  # exceeds max
+
+    def test_update_nonexistent_vehicle(self):
+        res = self.client.execute(
+            UPDATE, variables={"id": "999999", "input": valid_input(plateNumber="ZZ-9")},
+            context=self.ctx(self.alice))
+        self.assertIsNotNone(res.get("errors"))
+
+    def test_update_invalid_input_rejected(self):
+        v = self.add(self.alice, plateNumber="AA-1")
+        res = self.client.execute(
+            UPDATE, variables={"id": v["id"], "input": valid_input(year=5)},
+            context=self.ctx(self.alice))
+        self.assertIsNotNone(res.get("errors"))
+
+    def test_update_to_duplicate_plate_is_rejected(self):
+        self.add(self.alice, plateNumber="AA-1")
+        second = self.add(self.alice, plateNumber="AA-2")
+        res = self.client.execute(
+            UPDATE, variables={"id": second["id"], "input": valid_input(plateNumber="AA-1")},
+            context=self.ctx(self.alice))
+        self.assertIsNotNone(res.get("errors"))
+
+    def test_set_primary_nonexistent_vehicle(self):
+        res = self.client.execute(
+            SET_PRIMARY, variables={"id": "999999"}, context=self.ctx(self.alice))
+        self.assertIsNotNone(res.get("errors"))

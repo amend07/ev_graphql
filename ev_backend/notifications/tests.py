@@ -331,6 +331,16 @@ class NotificationPreferenceTests(NotificationBase):
         self.assertEqual(
             Notification.objects.filter(recipient=opted_out).count(), 0)
 
+    def test_notify_admins_can_exclude_the_actor(self):
+        actor = make_user("admin_actor", role="admin")
+        other = make_user("admin_other", role="admin")
+        notify_admins(
+            notification_type=Notification.TYPE_STATION, title="New owner",
+            exclude_id=actor.id,
+        )
+        self.assertEqual(Notification.objects.filter(recipient=actor).count(), 0)
+        self.assertEqual(Notification.objects.filter(recipient=other).count(), 1)
+
     def test_requires_authentication(self):
         res = self.client.execute(PREFS, context=self.ctx(AnonymousUser()))
         self.assertIsNotNone(res.get("errors"))
