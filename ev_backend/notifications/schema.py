@@ -4,7 +4,7 @@ from graphene_django import DjangoObjectType
 from accounts.permission import login_required
 from ev_backend.pagination import paginate
 
-from .models import Notification
+from .models import Notification, NotificationPreference
 
 
 class NotificationType(DjangoObjectType):
@@ -30,6 +30,32 @@ class NotificationPage(graphene.ObjectType):
     has_next = graphene.Boolean()
 
 
+class NotificationPreferenceType(graphene.ObjectType):
+    """A user's notification settings: a master switch and a flag per category."""
+
+    enabled = graphene.Boolean(required=True)
+    booking = graphene.Boolean(required=True)
+    review = graphene.Boolean(required=True)
+    station = graphene.Boolean(required=True)
+    system = graphene.Boolean(required=True)
+
+
+# The all-on default returned when a user has never saved preferences, so the
+# client renders every toggle on without a row having to exist yet.
+_DEFAULT_PREFERENCE = NotificationPreferenceType(
+    enabled=True, booking=True, review=True, station=True, system=True,
+)
+
+
+def _preference_payload(pref):
+    if pref is None:
+        return _DEFAULT_PREFERENCE
+    return NotificationPreferenceType(
+        enabled=pref.enabled, booking=pref.booking, review=pref.review,
+        station=pref.station, system=pref.system,
+    )
+
+
 class NotificationQuery(graphene.ObjectType):
     my_notifications_page = graphene.Field(
         NotificationPage,
@@ -38,6 +64,7 @@ class NotificationQuery(graphene.ObjectType):
         unread_only=graphene.Boolean(),
     )
     my_unread_notification_count = graphene.Int()
+    my_notification_preferences = graphene.Field(NotificationPreferenceType)
 
     @login_required
     def resolve_my_notifications_page(
@@ -54,6 +81,11 @@ class NotificationQuery(graphene.ObjectType):
         return Notification.objects.filter(
             recipient=info.context.user, is_read=False
         ).count()
+
+    @login_required
+    def resolve_my_notification_preferences(self, info):
+        pref = NotificationPreference.objects.filter(user=info.context.user).first()
+        return _preference_payload(pref)
 
 
 class MarkNotificationRead(graphene.Mutation):
@@ -90,6 +122,39 @@ class MarkAllNotificationsRead(graphene.Mutation):
         return MarkAllNotificationsRead(ok=True, updated=updated)
 
 
+class UpdateNotificationPreferences(graphene.Mutation):
+    ok = graphene.Boolean()
+    preferences = graphene.Field(NotificationPreferenceType)
+
+    class Arguments:
+        # All optional: a client sends only the toggles it changed; omitted
+        # fields keep their stored value (partial update).
+        enabled = graphene.Boolean()
+        booking = graphene.Boolean()
+        review = graphene.Boolean()
+        station = graphene.Boolean()
+        system = graphene.Boolean()
+
+    @login_required
+    def mutate(self, info, enabled=None, booking=None, review=None,
+               station=None, system=None):
+        user = info.context.user
+        pref, _ = NotificationPreference.objects.get_or_create(user=user)
+        updates = {
+            'enabled': enabled, 'booking': booking, 'review': review,
+            'station': station, 'system': system,
+        }
+        changed = [f for f, v in updates.items() if v is not None]
+        for field in changed:
+            setattr(pref, field, updates[field])
+        if changed:
+            pref.save(update_fields=changed + ['updated_at'])
+        return UpdateNotificationPreferences(
+            ok=True, preferences=_preference_payload(pref),
+        )
+
+
 class NotificationMutation(graphene.ObjectType):
     mark_notification_read = MarkNotificationRead.Field()
     mark_all_notifications_read = MarkAllNotificationsRead.Field()
+    update_notification_preferences = UpdateNotificationPreferences.Field()

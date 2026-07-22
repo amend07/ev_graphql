@@ -39,6 +39,7 @@ from stations.models import Favorite, Review, Station
 
 from .models import AuditLog, PasswordResetOTP
 from notifications.models import Notification
+from vehicles.models import Vehicle
 
 User = get_user_model()
 
@@ -73,10 +74,12 @@ COLLECTIONS = {
     'stationReviews': Collection(PAGE, actor='anon', args={'stationId': 'station'}),
     # Signed in: your own data.
     'myStations': Collection(WINDOW, actor='owner'),
+    'myStationsPage': Collection(PAGE, actor='owner'),
     'myFavorites': Collection(PAGE, actor='customer'),
     'myBookings': Collection(WINDOW, actor='customer'),
     'myBookingsPage': Collection(PAGE, actor='customer'),
     'myNotificationsPage': Collection(PAGE, actor='customer'),
+    'myVehiclesPage': Collection(PAGE, actor='customer'),
     # Owner: bookings on a station you own.
     'stationBookings': Collection(WINDOW, actor='owner', args={'bookingId': 'station'}),
     # Admin.
@@ -238,6 +241,13 @@ class CollectionFixture(TestCase):
             Notification.objects.create(
                 recipient=cls.customer, notification_type=Notification.TYPE_SYSTEM,
                 title=f'N{i}', body='seed',
+            )
+            # Customer 0 owns SEEDED vehicles -> myVehiclesPage is over-full. Only
+            # the first is primary (the partial unique constraint forbids more).
+            Vehicle.objects.create(
+                owner=cls.customer, make='Tesla', model=f'M{i}', year=2022,
+                battery_capacity_kwh=60, charger_type=Station.CHARGER_NACS,
+                plate_number=f'AA-{i:04d}', is_primary=(i == 0),
             )
             PasswordResetOTP.objects.create(
                 user=cls.customers[i], otp_hash='x', expires_at=now + timedelta(minutes=10),

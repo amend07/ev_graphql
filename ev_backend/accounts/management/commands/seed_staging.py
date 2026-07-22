@@ -34,6 +34,7 @@ from django.utils import timezone
 
 from bookings.models import Booking
 from stations.models import Favorite, Review, Station
+from vehicles.models import Vehicle
 
 User = get_user_model()
 
@@ -62,7 +63,10 @@ BOOKING_PLAN = {
     'rejected': 5,
 }
 
-CHARGER_TYPES = ['CCS2', 'CHAdeMO', 'Type 2', 'CCS2', 'Type 2']
+# Canonical connector codes (W9), spread across the full set so the connector
+# and charge-mode filters have variety to match against.
+CHARGER_TYPES = ['ccs2', 'chademo', 'type2', 'ccs', 'nacs', 'type1', 'gb_t']
+_DC_CONNECTORS = {'ccs', 'ccs2', 'chademo', 'gb_t', 'nacs'}
 LOCATIONS = [
     'Bole Road, Addis Ababa',
     'Kazanchis, Addis Ababa',
@@ -109,6 +113,7 @@ class Command(BaseCommand):
             bookings = self._seed_bookings(customers, stations)
             reviews = self._seed_reviews(bookings)
             favorites = self._seed_favorites(customers, stations)
+            self._seed_vehicles(customers)
 
         self._report(admins, owners, customers, stations, bookings, reviews, favorites)
 
@@ -198,6 +203,7 @@ class Command(BaseCommand):
         stations = []
         for i in range(STATION_COUNT):
             owner = holders[i % 3] if i >= 2 else holders[0]
+            connector = CHARGER_TYPES[i % len(CHARGER_TYPES)]
             stations.append(
                 Station.objects.create(
                     owner=owner,
@@ -207,7 +213,8 @@ class Command(BaseCommand):
                     latitude=9.0 + (i * 0.004),
                     longitude=38.7 + (i * 0.004),
                     availability='24/7' if i % 3 else 'Mon–Fri, 8am–8pm',
-                    charger_type=CHARGER_TYPES[i % len(CHARGER_TYPES)],
+                    charger_type=connector,
+                    charge_mode='dc' if connector in _DC_CONNECTORS else 'ac',
                     num_of_charger=1 + (i % 4),
                     power_output_kw=[22.0, 50.0, 150.0, 350.0][i % 4],
                     price_per_kwh=round(0.25 + (i % 5) * 0.05, 2),
@@ -304,6 +311,29 @@ class Command(BaseCommand):
                     Favorite.objects.create(user=customer, station=station)
                 )
         return favorites
+
+    def _seed_vehicles(self, customers):
+        """Give the first few customers a small garage, so the My Vehicles screen
+        and the primary-car marker have something to show."""
+        fleet = [
+            ('Tesla', 'Model 3', 2023, 60, 'nacs'),
+            ('Hyundai', 'Ioniq 5', 2022, 77, 'ccs2'),
+            ('Nissan', 'Leaf', 2021, 40, 'chademo'),
+            ('BYD', 'Atto 3', 2023, 60, 'gb_t'),
+        ]
+        for c_index, customer in enumerate(customers[:4]):
+            # Each customer gets 1–2 cars; the first is their primary.
+            count = 1 + (c_index % 2)
+            for v_index in range(count):
+                make, model, year, battery, connector = fleet[
+                    (c_index + v_index) % len(fleet)
+                ]
+                Vehicle.objects.create(
+                    owner=customer, make=make, model=model, year=year,
+                    battery_capacity_kwh=battery, charger_type=connector,
+                    plate_number=f'{PREFIX[:1].upper()}{c_index}{v_index}-{1000 + c_index}',
+                    is_primary=(v_index == 0),
+                )
 
     # ── reset / report ───────────────────────────────────────────────────
 

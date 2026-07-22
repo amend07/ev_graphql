@@ -12,8 +12,8 @@ from accounts.administration import approve_owner, reject_owner
 from accounts.services import create_account
 from bookings.models import Booking
 from ev_backend.schema import schema
-from notifications.models import Notification
-from notifications.service import notify
+from notifications.models import Notification, NotificationPreference
+from notifications.service import notify, notify_admins
 from stations.models import Station
 
 User = get_user_model()
@@ -33,6 +33,18 @@ mutation($id:ID!){
 }
 """
 MARK_ALL = "mutation{ markAllNotificationsRead{ ok updated } }"
+PREFS = """
+query{
+  myNotificationPreferences{ enabled booking review station system }
+}
+"""
+UPDATE_PREFS = """
+mutation($enabled:Boolean,$booking:Boolean,$review:Boolean,$station:Boolean,$system:Boolean){
+  updateNotificationPreferences(
+    enabled:$enabled, booking:$booking, review:$review, station:$station, system:$system
+  ){ ok preferences{ enabled booking review station system } }
+}
+"""
 
 CREATE_BOOKING = """
 mutation($s:ID!,$a:DateTime!,$b:DateTime!){
@@ -252,3 +264,73 @@ class NotificationTriggerTests(NotificationBase):
         make_user("admin_c", role="admin")
         create_account("plain_customer", "plain@x.com", "483920", is_station_owner=False)
         self.assertEqual(Notification.objects.count(), 0)
+
+
+class NotificationPreferenceTests(NotificationBase):
+    def setUp(self):
+        super().setUp()
+        self.user = make_user("prefuser")
+
+    def test_defaults_all_on_without_a_row(self):
+        res = self.client.execute(PREFS, context=self.ctx(self.user))
+        self.assertIsNone(res.get("errors"))
+        prefs = res["data"]["myNotificationPreferences"]
+        self.assertEqual(
+            prefs,
+            {"enabled": True, "booking": True, "review": True,
+             "station": True, "system": True},
+        )
+        # Reading defaults must not create a row.
+        self.assertFalse(NotificationPreference.objects.filter(user=self.user).exists())
+
+    def test_partial_update_persists_and_leaves_others_default(self):
+        res = self.client.execute(
+            UPDATE_PREFS, variables={"booking": False}, context=self.ctx(self.user)
+        )
+        self.assertIsNone(res.get("errors"), res.get("errors"))
+        prefs = res["data"]["updateNotificationPreferences"]["preferences"]
+        self.assertFalse(prefs["booking"])
+        self.assertTrue(prefs["review"])
+        self.assertTrue(prefs["enabled"])
+        pref = NotificationPreference.objects.get(user=self.user)
+        self.assertFalse(pref.booking)
+        self.assertTrue(pref.review)
+
+    def test_category_off_suppresses_only_that_category(self):
+        NotificationPreference.objects.create(user=self.user, booking=False)
+        booking = notify(
+            recipient=self.user, notification_type=Notification.TYPE_BOOKING,
+            title="B",
+        )
+        review = notify(
+            recipient=self.user, notification_type=Notification.TYPE_REVIEW,
+            title="R",
+        )
+        self.assertIsNone(booking)  # suppressed
+        self.assertIsNotNone(review)  # allowed
+        self.assertEqual(
+            Notification.objects.filter(recipient=self.user).count(), 1)
+
+    def test_master_off_suppresses_every_category(self):
+        NotificationPreference.objects.create(user=self.user, enabled=False)
+        for ntype in (Notification.TYPE_BOOKING, Notification.TYPE_SYSTEM):
+            self.assertIsNone(
+                notify(recipient=self.user, notification_type=ntype, title="x"))
+        self.assertEqual(
+            Notification.objects.filter(recipient=self.user).count(), 0)
+
+    def test_notify_admins_skips_admins_who_opted_out(self):
+        opted_in = make_user("admin_in", role="admin")
+        opted_out = make_user("admin_out", role="admin")
+        NotificationPreference.objects.create(user=opted_out, station=False)
+        notify_admins(
+            notification_type=Notification.TYPE_STATION, title="New owner",
+        )
+        self.assertEqual(
+            Notification.objects.filter(recipient=opted_in).count(), 1)
+        self.assertEqual(
+            Notification.objects.filter(recipient=opted_out).count(), 0)
+
+    def test_requires_authentication(self):
+        res = self.client.execute(PREFS, context=self.ctx(AnonymousUser()))
+        self.assertIsNotNone(res.get("errors"))

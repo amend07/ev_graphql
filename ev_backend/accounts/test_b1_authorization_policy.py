@@ -35,12 +35,16 @@ QUERY_POLICY = {
     # Signed in: your own data.
     'me': POLICY_AUTHENTICATED,
     'myStations': POLICY_AUTHENTICATED,
+    'myStationsPage': POLICY_AUTHENTICATED,
     'myFavorites': POLICY_AUTHENTICATED,
     'myBookings': POLICY_AUTHENTICATED,
     'myBookingsPage': POLICY_AUTHENTICATED,
     # Notifications: your own, for any signed-in user (customer/owner/admin).
     'myNotificationsPage': POLICY_AUTHENTICATED,
     'myUnreadNotificationCount': POLICY_AUTHENTICATED,
+    'myNotificationPreferences': POLICY_AUTHENTICATED,
+    # Your own garage (W9): any signed-in user.
+    'myVehiclesPage': POLICY_AUTHENTICATED,
     # Owner: another party's data, scoped to a station you own.
     'stationBookings': POLICY_OWNER,
     # Admin.
@@ -112,6 +116,7 @@ MUTATION_POLICY = {
     # Notifications: mark your own read; any signed-in user.
     'markNotificationRead': POLICY_AUTHENTICATED,
     'markAllNotificationsRead': POLICY_AUTHENTICATED,
+    'updateNotificationPreferences': POLICY_AUTHENTICATED,
     # Active account required for anything that writes domain data.
     'createBooking': POLICY_ACTIVE,
     'cancelBooking': POLICY_ACTIVE,
@@ -119,6 +124,12 @@ MUTATION_POLICY = {
     'updateReview': POLICY_ACTIVE,
     'deleteReview': POLICY_ACTIVE,
     'toggleFavoriteStation': POLICY_ACTIVE,
+    # My Vehicles (W9): writing your own garage needs an active account, matching
+    # every other domain write above.
+    'addVehicle': POLICY_ACTIVE,
+    'updateVehicle': POLICY_ACTIVE,
+    'setPrimaryVehicle': POLICY_ACTIVE,
+    'deleteVehicle': POLICY_ACTIVE,
     # Approved station owner.
     'createStation': POLICY_OWNER,
     'updateStation': POLICY_OWNER,

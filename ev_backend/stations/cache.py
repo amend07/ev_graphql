@@ -60,11 +60,15 @@ def get_public_station_rows():
             "latitude": s.latitude,
             "longitude": s.longitude,
             "charger_type": s.charger_type,
+            "charge_mode": s.charge_mode,
             "num_of_charger": s.num_of_charger,
             "num_of_rate": s.num_of_rate,
             "average_rate": round(s.average_rate, 1),
             "power_output_kw": s.power_output_kw,
             "price_per_kwh": str(s.price_per_kwh),
+            # Cached list is active-only, so this is always True here — included
+            # so StationListType built from a cache row still carries the field.
+            "is_active": s.is_active,
             "image": s.image.url if s.image else "",
         }
         for s in qs

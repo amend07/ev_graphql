@@ -50,3 +50,42 @@ class Notification(models.Model):
     def __str__(self):
         state = 'read' if self.is_read else 'unread'
         return f"{self.recipient.username} - {self.notification_type} ({state})"
+
+
+class NotificationPreference(models.Model):
+    """Per-user control over which notifications get created.
+
+    A master ``enabled`` switch plus one flag per :class:`Notification` category.
+    Absence of a row means "all on": creation is gated in
+    :func:`notifications.service.notify` / ``notify_admins``, and a user who has
+    never touched their settings must keep receiving everything. So the DEFAULTS
+    here are all True, and callers treat a missing row exactly like an all-True
+    row — no backfill needed for existing users.
+
+    The category flags line up 1:1 with ``Notification.TYPE_*`` so gating is a
+    single ``getattr(pref, notification_type)``.
+    """
+
+    user = models.OneToOneField(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='notification_preference',
+    )
+    # Master switch: off silences every category.
+    enabled = models.BooleanField(default=True)
+    booking = models.BooleanField(default=True)
+    review = models.BooleanField(default=True)
+    station = models.BooleanField(default=True)
+    system = models.BooleanField(default=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def allows(self, notification_type):
+        """Whether a notification of this category may be created for this user."""
+        if not self.enabled:
+            return False
+        # Unknown/future categories default to allowed rather than silently dropped.
+        return bool(getattr(self, notification_type, True))
+
+    def __str__(self):
+        state = 'on' if self.enabled else 'off'
+        return f"{self.user.username} notification prefs ({state})"

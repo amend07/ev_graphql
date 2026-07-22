@@ -25,6 +25,37 @@ def review_stats():
 
 
 class Station(models.Model):
+    # Canonical connector codes (Sprint W9 filtering). Stored lower-case and
+    # matched exactly by the filter, so "ccs" no longer also matches "ccs2" the
+    # way the old `icontains` substring filter did. The human labels are the
+    # display strings both clients render; the codes are the wire values.
+    CHARGER_CCS = 'ccs'
+    CHARGER_CCS2 = 'ccs2'
+    CHARGER_TYPE1 = 'type1'
+    CHARGER_TYPE2 = 'type2'
+    CHARGER_CHADEMO = 'chademo'
+    CHARGER_GB_T = 'gb_t'
+    CHARGER_NACS = 'nacs'
+    CHARGER_TYPE_CHOICES = (
+        (CHARGER_CCS, 'CCS'),
+        (CHARGER_CCS2, 'CCS2'),
+        (CHARGER_TYPE1, 'Type 1'),
+        (CHARGER_TYPE2, 'Type 2'),
+        (CHARGER_CHADEMO, 'CHAdeMO'),
+        (CHARGER_GB_T, 'GB/T'),
+        (CHARGER_NACS, 'NACS'),
+    )
+
+    # AC vs DC current. A real per-station field (owner-set) rather than derived
+    # from the connector, because the connector does not settle it: a Type 2
+    # socket can be AC or DC in the field, and NACS spans both.
+    MODE_AC = 'ac'
+    MODE_DC = 'dc'
+    CHARGE_MODE_CHOICES = (
+        (MODE_AC, 'AC'),
+        (MODE_DC, 'DC'),
+    )
+
     owner = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.CASCADE,
@@ -48,7 +79,10 @@ class Station(models.Model):
     amenities = models.TextField(blank=True)
 
     # Charger Info
-    charger_type = models.CharField(max_length=50)
+    charger_type = models.CharField(max_length=50, choices=CHARGER_TYPE_CHOICES)
+    charge_mode = models.CharField(
+        max_length=2, choices=CHARGE_MODE_CHOICES, default=MODE_AC,
+    )
     station_count = models.PositiveIntegerField(default=1)
     num_of_charger = models.PositiveIntegerField(default=1)
     power_output_kw = models.FloatField(default=22.0)

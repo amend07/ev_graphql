@@ -11,6 +11,8 @@ from .validators import (
     validate_station_input,
     validate_rating,
     validate_comment,
+    normalize_charger_type,
+    normalize_charge_mode,
 )
 from .cache import get_public_station_rows
 from accounts.permission import (
@@ -26,18 +28,27 @@ from notifications.service import notify
 
 # Row keys shared between the cached station list and StationListType.
 _ROW_KEYS = (
-    "station_id", "name", "latitude", "longitude", "charger_type",
+    "station_id", "name", "latitude", "longitude", "charger_type", "charge_mode",
     "num_of_charger", "num_of_rate", "average_rate", "power_output_kw",
-    "price_per_kwh", "image",
+    "price_per_kwh", "is_active", "image",
 )
 
 # Scalar Station fields accepted from input; used to build create/update payloads
 # without ever passing an explicit None (which would clobber model defaults).
 STATION_FIELDS = [
     "name", "contact_info", "description", "location", "latitude", "longitude",
-    "availability", "amenities", "charger_type", "station_count", "num_of_charger",
-    "power_output_kw", "estimated_time_min", "price_per_kwh", "charger_brand",
+    "availability", "amenities", "charger_type", "charge_mode", "station_count",
+    "num_of_charger", "power_output_kw", "estimated_time_min", "price_per_kwh",
+    "charger_brand",
 ]
+
+# Availability filter values (Sprint W9). "available"/"occupied" map onto the
+# station's is_active flag — the only occupancy signal the platform has; there is
+# no per-charger live telemetry. "all" (or an absent filter) keeps the historical
+# active-only default so anonymous discovery is unchanged unless a caller opts in.
+AVAILABILITY_ALL = 'all'
+AVAILABILITY_AVAILABLE = 'available'
+AVAILABILITY_OCCUPIED = 'occupied'
 
 
 class PublicUserType(graphene.ObjectType):
@@ -71,6 +82,11 @@ class StationType(DjangoObjectType):
 
     class Meta:
         model = Station
+        # charger_type/charge_mode gained `choices` in W9; without this,
+        # graphene-django would convert them to generated enums and change
+        # `chargerType`/`chargeMode` from String to an enum in the SDL — a
+        # breaking change for both shipped clients. Keep them plain strings.
+        convert_choices_to_enum = False
         # Explicit allow-list (B1 Phase 1). `__all__` silently published every
         # future field and every reverse relation — `bookings`, `reviews`,
         # `favorited_by` — which is how a station leaked its customers' identities
@@ -79,8 +95,9 @@ class StationType(DjangoObjectType):
         fields = (
             "id", "name", "contact_info", "description", "image", "is_active",
             "location", "latitude", "longitude", "availability", "amenities",
-            "charger_type", "station_count", "num_of_charger", "power_output_kw",
-            "estimated_time_min", "price_per_kwh", "charger_brand", "created_at",
+            "charger_type", "charge_mode", "station_count", "num_of_charger",
+            "power_output_kw", "estimated_time_min", "price_per_kwh",
+            "charger_brand", "created_at",
         )
 
     def resolve_owner(self, info):
@@ -130,6 +147,7 @@ class CreateStationInput(graphene.InputObjectType):
     availability = graphene.String()
     amenities = graphene.String()
     charger_type = graphene.String()
+    charge_mode = graphene.String(description="AC or DC.")
     station_count = graphene.Int()
     num_of_charger = graphene.Int()
     power_output_kw = graphene.Float()
@@ -144,11 +162,15 @@ class StationListType(graphene.ObjectType):
     latitude = graphene.Float()
     longitude = graphene.Float()
     charger_type = graphene.String()
+    charge_mode = graphene.String()
     num_of_charger = graphene.Int()
     num_of_rate = graphene.Int()
     average_rate = graphene.Float()
     power_output_kw = graphene.Float()
     price_per_kwh = graphene.String()
+    # Occupancy signal for the availability filter: active == "available",
+    # inactive == "occupied"/taken. The only status the platform tracks.
+    is_active = graphene.Boolean()
     is_favorite = graphene.Boolean()
     image = graphene.String()
 
@@ -173,19 +195,30 @@ def _station_to_list_type(s, is_favorite=None):
         latitude=s.latitude,
         longitude=s.longitude,
         charger_type=s.charger_type,
+        charge_mode=s.charge_mode,
         num_of_charger=s.num_of_charger,
         num_of_rate=getattr(s, "num_of_rate", 0),
         average_rate=round(getattr(s, "average_rate", 0.0), 1),
         power_output_kw=s.power_output_kw,
         price_per_kwh=str(s.price_per_kwh),
+        is_active=s.is_active,
         is_favorite=getattr(s, "is_favorite", False) if is_favorite is None else is_favorite,
         image=s.image.url if s.image else "",
     )
 
 
 def _input_to_data(input):
-    """Provided (non-None) scalar fields only, so model defaults still apply."""
-    return {f: getattr(input, f) for f in STATION_FIELDS if getattr(input, f, None) is not None}
+    """Provided (non-None) scalar fields only, so model defaults still apply.
+
+    Connector and mode strings are folded onto their canonical codes here, so a
+    client sending "Type 2" or "DC" is stored as "type2"/"dc" and matches the
+    filter (which compares against canonical codes)."""
+    data = {f: getattr(input, f) for f in STATION_FIELDS if getattr(input, f, None) is not None}
+    if "charger_type" in data:
+        data["charger_type"] = normalize_charger_type(data["charger_type"])
+    if "charge_mode" in data:
+        data["charge_mode"] = normalize_charge_mode(data["charge_mode"])
+    return data
 
 
 class CreateStation(graphene.Mutation):
@@ -728,26 +761,63 @@ class StationAdminMutation(graphene.ObjectType):
     admin_delete_review = AdminDeleteReview.Field()
 
 
-def _annotated_stations(user):
-    """Active stations annotated with review stats and (auth) is_favorite."""
-    qs = Station.objects.filter(is_active=True).annotate(**review_stats())
+def _annotated_stations(user, *, active_only=True):
+    """Stations annotated with review stats and (auth) is_favorite.
+
+    ``active_only`` defaults True so anonymous discovery keeps showing only live
+    stations. The availability filter flips it off to reach taken-down ("occupied")
+    stations — see ``_availability_scope``."""
+    base = Station.objects.filter(is_active=True) if active_only else Station.objects.all()
+    qs = base.annotate(**review_stats())
     if user.is_authenticated:
         favorite = Favorite.objects.filter(user=user, station=OuterRef("pk"))
         return qs.annotate(is_favorite=Exists(favorite))
     return qs.annotate(is_favorite=Value(False))
 
 
-def _apply_station_filters(qs, charger_type, num_of_charger, min_rating, min_power, max_power):
+def _availability_scope(availability):
+    """Resolve the availability filter to ``(active_only_base, is_active_eq)``.
+
+    * ``None``       — historical default: only active stations, no explicit filter.
+    * ``all``        — both active and inactive.
+    * ``available``  — active only.
+    * ``occupied``   — inactive only (taken down / out of service).
+    """
+    if availability == AVAILABILITY_ALL:
+        return False, None
+    if availability == AVAILABILITY_AVAILABLE:
+        return True, True
+    if availability == AVAILABILITY_OCCUPIED:
+        return False, False
+    return True, None  # None or anything unrecognised: unchanged behaviour
+
+
+def _apply_station_filters(qs, *, charger_type=None, charge_mode=None,
+                           num_of_charger=None, min_rating=None, max_rating=None,
+                           min_power=None, max_power=None, min_price=None,
+                           max_price=None, is_active=None):
     if charger_type:
-        qs = qs.filter(charger_type__icontains=charger_type)
+        # Exact (case-insensitive) match on the canonical code, so "ccs" no longer
+        # also matches "ccs2". Input is normalised so "Type 2"/"CCS" still resolve.
+        qs = qs.filter(charger_type__iexact=normalize_charger_type(charger_type))
+    if charge_mode:
+        qs = qs.filter(charge_mode__iexact=normalize_charge_mode(charge_mode))
     if num_of_charger:
         qs = qs.filter(num_of_charger=num_of_charger)
     if min_rating is not None:
         qs = qs.filter(average_rate__gte=min_rating)
+    if max_rating is not None:
+        qs = qs.filter(average_rate__lte=max_rating)
     if min_power is not None:
         qs = qs.filter(power_output_kw__gte=min_power)
     if max_power is not None:
         qs = qs.filter(power_output_kw__lte=max_power)
+    if min_price is not None:
+        qs = qs.filter(price_per_kwh__gte=min_price)
+    if max_price is not None:
+        qs = qs.filter(price_per_kwh__lte=max_price)
+    if is_active is not None:
+        qs = qs.filter(is_active=is_active)
     return qs
 
 
@@ -755,10 +825,18 @@ def _station_filter_args():
     # Fresh argument instances per field (graphene must not share mounted args).
     return dict(
         charger_type=graphene.String(),
+        charge_mode=graphene.String(description="AC or DC."),
         num_of_charger=graphene.Int(),
         min_rating=graphene.Float(),
+        max_rating=graphene.Float(),
         min_power=graphene.Float(),
         max_power=graphene.Float(),
+        min_price=graphene.Float(),
+        max_price=graphene.Float(),
+        availability=graphene.String(
+            description="all | available | occupied. 'occupied' surfaces "
+                        "out-of-service stations; absent keeps active-only.",
+        ),
         limit=graphene.Int(),
         offset=graphene.Int(),
     )
@@ -769,6 +847,11 @@ class StationQuery(graphene.ObjectType):
     filter_stations = graphene.List(StationListType, **_station_filter_args())
     station_by_id = graphene.Field(StationType, station_id=graphene.ID(required=True))
     my_stations = graphene.List(StationListType, limit=graphene.Int(), offset=graphene.Int())
+    # Paginated twin of my_stations (totalCount + hasNext), so the owner's "My
+    # Stations" list can page. my_stations stays for the shipped client.
+    my_stations_page = graphene.Field(
+        StationPage, limit=graphene.Int(), offset=graphene.Int(),
+    )
 
     # Proper paginated endpoints with a total count (Part 2).
     stations_page = graphene.Field(StationPage, **_station_filter_args())
@@ -800,12 +883,18 @@ class StationQuery(graphene.ObjectType):
         ]
 
     @public
-    def resolve_filter_stations(self, info, charger_type=None, num_of_charger=None,
-                                min_rating=None, min_power=None, max_power=None,
+    def resolve_filter_stations(self, info, charger_type=None, charge_mode=None,
+                                num_of_charger=None, min_rating=None, max_rating=None,
+                                min_power=None, max_power=None, min_price=None,
+                                max_price=None, availability=None,
                                 limit=None, offset=None):
+        active_only, is_active = _availability_scope(availability)
         qs = _apply_station_filters(
-            _annotated_stations(info.context.user),
-            charger_type, num_of_charger, min_rating, min_power, max_power,
+            _annotated_stations(info.context.user, active_only=active_only),
+            charger_type=charger_type, charge_mode=charge_mode,
+            num_of_charger=num_of_charger, min_rating=min_rating,
+            max_rating=max_rating, min_power=min_power, max_power=max_power,
+            min_price=min_price, max_price=max_price, is_active=is_active,
         )
         return [_station_to_list_type(s) for s in window(qs, limit, offset)]
 
@@ -818,13 +907,34 @@ class StationQuery(graphene.ObjectType):
         )
         return [_station_to_list_type(s) for s in window(qs, limit, offset)]
 
+    @login_required
+    def resolve_my_stations_page(self, info, limit=None, offset=None):
+        # Owner-scoped and active-only, exactly like my_stations. Deterministic
+        # order (newest first, id as tie-break) so paging never skips or repeats.
+        user = info.context.user
+        qs = Station.objects.filter(owner=user, is_active=True).annotate(
+            is_favorite=Exists(Favorite.objects.filter(user=user, station=OuterRef("pk"))),
+            **review_stats(),
+        ).order_by("-created_at", "-id")
+        items, total, has_next = paginate(qs, limit, offset)
+        return StationPage(
+            items=[_station_to_list_type(s) for s in items],
+            total_count=total, has_next=has_next,
+        )
+
     @public
-    def resolve_stations_page(self, info, charger_type=None, num_of_charger=None,
-                              min_rating=None, min_power=None, max_power=None,
+    def resolve_stations_page(self, info, charger_type=None, charge_mode=None,
+                              num_of_charger=None, min_rating=None, max_rating=None,
+                              min_power=None, max_power=None, min_price=None,
+                              max_price=None, availability=None,
                               limit=None, offset=None):
+        active_only, is_active = _availability_scope(availability)
         qs = _apply_station_filters(
-            _annotated_stations(info.context.user),
-            charger_type, num_of_charger, min_rating, min_power, max_power,
+            _annotated_stations(info.context.user, active_only=active_only),
+            charger_type=charger_type, charge_mode=charge_mode,
+            num_of_charger=num_of_charger, min_rating=min_rating,
+            max_rating=max_rating, min_power=min_power, max_power=max_power,
+            min_price=min_price, max_price=max_price, is_active=is_active,
         ).order_by("id")
         items, total, has_next = paginate(qs, limit, offset)
         return StationPage(
