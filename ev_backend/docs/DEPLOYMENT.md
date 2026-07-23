@@ -45,6 +45,11 @@ secure configuration is missing** — see the fail-fast list in
 | `SECURE_SSL_REDIRECT` | — | `True` (prod) | Redirect HTTP→HTTPS. |
 | `SECURE_HSTS_SECONDS` | — | `31536000` | HSTS max-age. |
 | `STATIC_ROOT` / `MEDIA_ROOT` | — | `staticfiles/` / `media/` | Collected static / uploads. |
+| `GRAPHQL_MAX_DEPTH` | — | `12` | Max query nesting depth (introspection exempt). |
+| `GRAPHQL_MAX_FIELDS` | — | `200` | Max total selected fields per operation (fragments expanded; introspection exempt). Largest real client query is ~24. |
+| `GRAPHQL_MAX_ALIASES` | — | `50` | Max aliased selections per operation — blocks alias amplification. |
+| `GRAPHQL_ALLOW_INTROSPECTION` | — | `= DEBUG` (off in prod) | Allow `__schema`/`__type`. Off in production; set `True` to re-enable deliberately (e.g. codegen against staging). GraphiQL in DEBUG is unaffected. |
+| `RL_GRAPHQL_LIMIT` / `RL_GRAPHQL_WINDOW` / `RL_GRAPHQL_LOCKOUT` | — | `6000` / `60` / `60` | Endpoint-wide `/graphql/` throttle (per-IP, and per-user when authenticated), window/lockout in seconds. Off in DEBUG; uses the shared cache (`REDIS_URL`). Generous defaults that won't affect normal use. |
 | `APP_VERSION` | — | `1.0.0` | Reported by `/version/`. |
 | `LOG_LEVEL` / `DJANGO_LOG_LEVEL` / `APP_LOG_LEVEL` / `AUTH_LOG_LEVEL` | — | `INFO` | Log levels. |
 

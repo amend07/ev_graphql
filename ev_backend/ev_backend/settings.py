@@ -388,6 +388,23 @@ GRAPHQL_LIST_HARD_CAP = config('GRAPHQL_LIST_HARD_CAP', default=500, cast=int)
 
 # Query complexity protection (Part 5)
 GRAPHQL_MAX_DEPTH = config('GRAPHQL_MAX_DEPTH', default=12, cast=int)
+# Breadth/cost caps: reject shallow-but-wide or heavily-aliased queries that the
+# depth limit alone can't stop. The largest real client query (web + mobile) is
+# ~24 fields with no aliases, so these defaults leave comfortable headroom while
+# still blocking abuse. Introspection meta-fields are exempt (see the validator).
+GRAPHQL_MAX_FIELDS = config('GRAPHQL_MAX_FIELDS', default=200, cast=int)
+GRAPHQL_MAX_ALIASES = config('GRAPHQL_MAX_ALIASES', default=50, cast=int)
+# Introspection (__schema/__type) hands the schema to any caller. Off in prod,
+# on in DEBUG (GraphiQL/codegen need it); flip on deliberately to re-enable.
+GRAPHQL_ALLOW_INTROSPECTION = config('GRAPHQL_ALLOW_INTROSPECTION', default=DEBUG, cast=bool)
+# Endpoint-wide throttle (per-IP, and per-user when authenticated), enforced in
+# HardenedGraphQLView before execution. Off in DEBUG. Generous defaults that
+# won't affect normal use; window/lockout in seconds.
+GRAPHQL_RATELIMIT = {
+    "limit": config('RL_GRAPHQL_LIMIT', default=6000, cast=int),
+    "window": config('RL_GRAPHQL_WINDOW', default=60, cast=int),
+    "lockout": config('RL_GRAPHQL_LOCKOUT', default=60, cast=int),
+}
 # Reject oversized request bodies before parsing (bytes). Also guards file uploads.
 DATA_UPLOAD_MAX_MEMORY_SIZE = config('DATA_UPLOAD_MAX_MEMORY_SIZE', default=5 * 1024 * 1024, cast=int)
 DATA_UPLOAD_MAX_NUMBER_FIELDS = config('DATA_UPLOAD_MAX_NUMBER_FIELDS', default=1000, cast=int)

@@ -47,16 +47,19 @@ def _key(scope, kind, identifier):
     return f"authrl:{scope}:{kind}:{identifier}"
 
 
-def enforce(scope, identifier, kind="ip"):
+def enforce(scope, identifier, kind="ip", config=None):
     """Count one attempt for ``(scope, kind, identifier)``.
 
     Raises :class:`RateLimitExceeded` if the identifier is locked out or exceeds
     the configured limit within the window. On exceeding the limit a lockout key
     is set for ``lockout`` seconds.
+
+    ``config`` may be an explicit ``{limit, window, lockout}`` dict for scopes not
+    described by ``AUTH_RATELIMIT`` (e.g. the endpoint-wide GraphQL limit).
     """
     if not identifier:
         return
-    cfg = _config(scope)
+    cfg = config or _config(scope)
     base = _key(scope, kind, identifier)
     lock_key = base + ":lock"
 
