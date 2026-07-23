@@ -33,7 +33,7 @@ secure configuration is missing** — see the fail-fast list in
 | `DATABASE_URL` | ✅ | SQLite (dev) | e.g. `postgres://user:pass@host:5432/db`. |
 | `DB_SSL_REQUIRE` | — | `False` | Require TLS to the database. |
 | `DB_CONN_MAX_AGE` | — | `600` | Persistent connection lifetime (s). |
-| `REDIS_URL` | recommended | LocMem | Shared cache; required for correct multi-process rate limiting/caching. |
+| `REDIS_URL` | **required (prod)** | LocMem (dev) | Shared cache. REQUIRED in production — prod refuses to start without it, because per-process rate-limit counters defeat brute-force protection. |
 | `JWT_SECRET_KEY` | — | `DJANGO_SECRET_KEY` | JWT signing key. |
 | `JWT_ACCESS_MINUTES` / `JWT_REFRESH_DAYS` | — | `30` / `7` | Token lifetimes. |
 | `EMAIL_HOST_USER` / `EMAIL_HOST_PASSWORD` | ✅ (SMTP) | empty | OTP email delivery. |

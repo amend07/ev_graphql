@@ -437,8 +437,18 @@ if (not DEBUG and not _RUNNING_TESTS
         _problems.append('EMAIL_HOST_USER/EMAIL_HOST_PASSWORD are required for SMTP email (OTP delivery).')
     if not DATABASE_URL and DATABASES['default']['ENGINE'].endswith('sqlite3'):
         _problems.append('DATABASE_URL must point at a production database (SQLite is not supported in production).')
-    if not CACHES.get('default'):
-        _problems.append('A cache backend must be configured (set REDIS_URL for a shared cache).')
+    # A per-process cache (LocMemCache) is worse than useless here: the rate-limit
+    # and lockout counters live in this cache, so with N Gunicorn workers the
+    # effective login/OTP limits become ~N× and lockouts never propagate —
+    # silently defeating brute-force protection on the 6-digit PIN. Require a
+    # SHARED cache in production, not merely "a cache".
+    _cache_backend = CACHES.get('default', {}).get('BACKEND', '')
+    if not _cache_backend or _cache_backend.endswith('locmem.LocMemCache'):
+        _problems.append(
+            'A SHARED cache backend is required in production (set REDIS_URL). '
+            'The default per-process LocMemCache makes rate-limiting per-worker, '
+            'which defeats brute-force/OTP protection.'
+        )
     # ConsoleSmsBackend writes the verification code in clear text to the log.
     # On a real deploy that puts a live credential into the log aggregator, where
     # it is readable by everyone with log access and retained for as long as logs

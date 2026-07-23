@@ -10,7 +10,7 @@ With `DJANGO_DEBUG=False`, the app **refuses to start** unless all of these hold
 - [ ] `JWT_SECRET_KEY` (or `DJANGO_SECRET_KEY`) is a strong secret
 - [ ] `EMAIL_HOST_USER` / `EMAIL_HOST_PASSWORD` configured when using SMTP
 - [ ] `DATABASE_URL` points at a production database (SQLite rejected)
-- [ ] A cache backend is configured (`REDIS_URL` for a shared cache)
+- [ ] A **shared** cache is configured (`REDIS_URL`) — required; prod will not boot on per-process LocMemCache
 
 ## Pre-deploy
 

@@ -2,6 +2,10 @@
 the query-depth validator's fragment handling, pagination edge cases, and the
 CSRF-exemption middleware."""
 
+import os
+import subprocess
+import sys
+
 from django.test import RequestFactory, TestCase, override_settings
 from graphql import GraphQLError, parse, validate
 
@@ -90,3 +94,51 @@ class DisableCSRFMiddlewareTests(TestCase):
         request = RequestFactory().post("/other/")
         mw.process_request(request)
         self.assertFalse(getattr(request, "_dont_enforce_csrf_checks", False))
+
+
+class ProductionCacheGuardTests(TestCase):
+    """The fail-fast prod check must REFUSE to boot on a per-process cache.
+
+    Rate-limit/lockout counters live in the default cache; on LocMemCache across
+    N Gunicorn workers the effective login/OTP limits become ~Nx, defeating
+    brute-force protection. The guard runs at settings-import time (skipped under
+    the test runner), so we boot a real subprocess with a full production env.
+    """
+
+    #: A complete, valid production env EXCEPT the cache — so only the cache
+    #: check can fire. Overridden per-case with/without REDIS_URL.
+    def _prod_env(self, **overrides):
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith(('DJANGO_', 'JWT_', 'DATABASE_', 'REDIS_',
+                                     'EMAIL_', 'SMS_', 'CORS_', 'CSRF_'))}
+        env.update({
+            'DJANGO_SETTINGS_MODULE': 'ev_backend.settings',
+            'DJANGO_DEBUG': 'False',
+            'DJANGO_SECRET_KEY': 'a-strong-unique-production-secret-value-123456',
+            'DJANGO_ALLOWED_HOSTS': 'example.com',
+            'DATABASE_URL': 'postgres://u:p@db:5432/app',
+            'EMAIL_BACKEND': 'django.core.mail.backends.console.EmailBackend',
+            'SMS_BACKEND': 'disabled',
+        })
+        env.update(overrides)
+        return env
+
+    def _boot(self, env):
+        return subprocess.run(
+            [sys.executable, '-c', 'import django; django.setup()'],
+            env=env, capture_output=True, text=True, cwd=os.getcwd(),
+        )
+
+    def test_locmemcache_is_rejected_in_production(self):
+        # No REDIS_URL -> LocMemCache -> must refuse to start.
+        result = self._boot(self._prod_env())
+        self.assertNotEqual(result.returncode, 0,
+                            f"settings booted on LocMemCache: {result.stderr}")
+        self.assertIn('SHARED cache', result.stderr)
+        self.assertIn('REDIS_URL', result.stderr)
+
+    def test_redis_cache_is_accepted_in_production(self):
+        # With a shared cache and otherwise-valid config, settings must import.
+        result = self._boot(self._prod_env(REDIS_URL='redis://cache:6379/0'))
+        self.assertEqual(result.returncode, 0,
+                         f"settings refused a valid prod config: {result.stderr}")
