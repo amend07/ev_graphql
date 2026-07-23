@@ -2,7 +2,7 @@
 # plus the packages required to run in production.
 
 # --- Framework & API ---
-Django==5.2.7
+Django==5.2.16
 graphene==3.4.3
 graphene-django==3.2.3
 graphene-file-upload==1.3.0
@@ -13,18 +13,18 @@ graphql-core==3.2.6
 graphql-relay==3.2.0
 
 # --- Auth / utils ---
-PyJWT==2.10.1
+PyJWT==2.13.0
 # Required by PyJWT to verify RS256 Google/Apple ID tokens (W8 social sign-in,
 # accounts/social.py; PyJWKClient fetches each provider's JWKS).
 cryptography==49.0.0
 python-decouple==3.8
 promise==2.3
 python-dateutil==2.9.0.post0
-sqlparse==0.5.3
+sqlparse==0.5.5
 asgiref==3.9.2
 
 # --- Media handling ---
-Pillow==11.3.0
+Pillow==12.3.0
 
 # --- Production server & infrastructure ---
 gunicorn==23.0.0
