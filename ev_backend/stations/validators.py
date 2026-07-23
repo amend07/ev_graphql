@@ -139,6 +139,55 @@ def validate_charger_count(value, field="Charger count"):
         raise InvalidInput(f"{field} exceeds the maximum allowed.")
 
 
+# Raster formats we accept for station images. SVG is deliberately excluded: it
+# is not a raster image (Pillow can't decode it, so it fails the check below) and
+# an SVG served same-origin is a stored-XSS vector.
+_ALLOWED_IMAGE_FORMATS = {'JPEG', 'PNG', 'WEBP'}
+_ALLOWED_IMAGE_TYPES = {'image/jpeg', 'image/png', 'image/webp'}
+
+
+def validate_image(image):
+    """Validate an uploaded station image.
+
+    The resolver calls ``Station.objects.create()`` directly, so Django's
+    ImageField/Pillow validation never runs — an "image" could be any file of any
+    content-type. This closes that: it caps the size, checks the declared
+    content-type, and — the real defence against content-type spoofing — actually
+    decodes the file with Pillow and requires a known raster format."""
+    if image is None:
+        return
+
+    size = getattr(image, 'size', None)
+    max_bytes = settings.STATION_MAX_IMAGE_BYTES
+    if size is not None and size > max_bytes:
+        raise InvalidInput(
+            f"Image must be at most {max_bytes // (1024 * 1024)} MB."
+        )
+
+    content_type = (getattr(image, 'content_type', '') or '').lower()
+    if content_type and content_type not in _ALLOWED_IMAGE_TYPES:
+        raise InvalidInput("Image must be a JPEG, PNG, or WebP.")
+
+    # Decode it: defeats a spoofed content-type / non-image payload / SVG.
+    try:
+        from PIL import Image
+        if hasattr(image, 'seek'):
+            image.seek(0)
+        parsed = Image.open(image)
+        fmt = parsed.format
+        parsed.verify()
+    except InvalidInput:
+        raise
+    except Exception:
+        raise InvalidInput("Uploaded file is not a valid image.")
+    finally:
+        if hasattr(image, 'seek'):
+            image.seek(0)
+
+    if fmt not in _ALLOWED_IMAGE_FORMATS:
+        raise InvalidInput("Image must be a JPEG, PNG, or WebP.")
+
+
 def validate_station_input(data, *, partial=False):
     """Validate a create (``partial=False``) or update (``partial=True``) payload.
 

@@ -9,6 +9,7 @@ from .models import Favorite, Review, Station, review_stats
 from .validators import (
     InvalidInput,
     validate_station_input,
+    validate_image,
     validate_rating,
     validate_comment,
     normalize_charger_type,
@@ -235,6 +236,7 @@ class CreateStation(graphene.Mutation):
 
         try:
             validate_station_input(data, partial=False)
+            validate_image(image)
         except InvalidInput as e:
             raise Exception(str(e))
 
@@ -276,6 +278,10 @@ class UpdateStation(graphene.Mutation):
                 setattr(station, field, value)
 
         if image:
+            try:
+                validate_image(image)
+            except InvalidInput as e:
+                raise Exception(str(e))
             station.image = image
 
         station.save()

@@ -360,6 +360,9 @@ STATION_MAX_DESCRIPTION_LENGTH = config('STATION_MAX_DESCRIPTION_LENGTH', defaul
 STATION_MAX_POWER_KW = config('STATION_MAX_POWER_KW', default=1000, cast=int)
 STATION_MAX_PRICE_PER_KWH = config('STATION_MAX_PRICE_PER_KWH', default=10000, cast=int)
 STATION_MAX_CHARGERS = config('STATION_MAX_CHARGERS', default=1000, cast=int)
+# Max station image upload size (bytes). Files are also decoded with Pillow and
+# must be a JPEG/PNG/WebP (see stations.validators.validate_image).
+STATION_MAX_IMAGE_BYTES = config('STATION_MAX_IMAGE_BYTES', default=5 * 1024 * 1024, cast=int)
 # Optional allow-list of charger types; empty = accept any non-blank value
 # (keeps compatibility with values the Flutter client already sends).
 STATION_CHARGER_TYPES = [t for t in config('STATION_CHARGER_TYPES', default='').split(',') if t.strip()]

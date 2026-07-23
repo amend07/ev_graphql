@@ -105,6 +105,12 @@ class Station(models.Model):
         indexes = [
             models.Index(fields=["is_active"], name="station_is_active_idx"),
             models.Index(fields=["owner", "is_active"], name="station_owner_active_idx"),
+            # W9 filter columns (filterStations / stationsPage). Without these the
+            # connector/mode/power/price filters full-scan the active-station set.
+            models.Index(fields=["charger_type"], name="station_charger_type_idx"),
+            models.Index(fields=["charge_mode"], name="station_charge_mode_idx"),
+            models.Index(fields=["power_output_kw"], name="station_power_idx"),
+            models.Index(fields=["price_per_kwh"], name="station_price_idx"),
         ]
         constraints = [
             models.CheckConstraint(

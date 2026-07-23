@@ -500,3 +500,40 @@ class StationAdminFilterTests(StationTestBase):
         self.assertIsNone(res.get("errors"), res.get("errors"))
         # No reviews -> average_rate 0 -> nothing meets minRating 1.
         self.assertEqual(res["data"]["stationsPageAdmin"]["totalCount"], 0)
+
+
+class ImageUploadValidationTests(TestCase):
+    """Station image uploads must be real, bounded raster images (W9 hardening)."""
+
+    def _png(self, name="a.png", content_type="image/png"):
+        import io
+        from PIL import Image
+        from django.core.files.uploadedfile import SimpleUploadedFile
+        buf = io.BytesIO()
+        Image.new("RGB", (4, 4), "red").save(buf, format="PNG")
+        return SimpleUploadedFile(name, buf.getvalue(), content_type=content_type)
+
+    def test_valid_png_is_accepted(self):
+        from stations.validators import validate_image
+        validate_image(self._png())  # must not raise
+
+    def test_non_image_payload_is_rejected(self):
+        from django.core.files.uploadedfile import SimpleUploadedFile
+        from stations.validators import validate_image, InvalidInput
+        # A script masquerading as a png (content-type spoof).
+        evil = SimpleUploadedFile(
+            "x.png", b"<script>alert(1)</script>", content_type="image/png")
+        with self.assertRaises(InvalidInput):
+            validate_image(evil)
+
+    def test_disallowed_content_type_is_rejected(self):
+        from stations.validators import validate_image, InvalidInput
+        with self.assertRaises(InvalidInput):
+            validate_image(self._png(name="x.svg", content_type="image/svg+xml"))
+
+    def test_oversized_image_is_rejected(self):
+        from django.test import override_settings
+        from stations.validators import validate_image, InvalidInput
+        with override_settings(STATION_MAX_IMAGE_BYTES=10):
+            with self.assertRaises(InvalidInput):
+                validate_image(self._png())
